@@ -1,21 +1,23 @@
 """
-train.py — Constrained Contrastive RL (C-CRL).
+train.py — Constrained Contrastive RL (C-CRL)
 
 Drop-in replacement for scaling-crl/train.py that adds:
-  • CostCritic network (Bellman-backed Q_c)
-  • Hybrid step cost from maze geometry
-  • Lagrangian actor loss:  L_actor = E[α·log π - Q + λ·Q_c]
-  • Dual ascent on λ with cost budget
-  • Full cost metric logging to wandb
+  • CostCritic  Q_c(s,a,g)  trained with Bellman backups
+  • Hybrid step cost  c = α·1{collision} + (1-α)·exp(-d/σ)
+  • Lagrangian actor loss  L = E[α_sac·log π - Q + λ·Q_c]
+  • Dual ascent  λ ← clip(λ + lr_λ·(Ĵ_c - d), 0, λ_max)
+  • Full wandb logging of cost metrics
 
-All original CRL logic is preserved verbatim.
+All original CRL logic (InfoNCE critic, residual networks, SAC
+entropy, geometric goal relabeling) is preserved exactly.
 """
 
+import functools
 import os
 import pickle
 import time
-from dataclasses import dataclass, field
-from typing import NamedTuple, Sequence
+from dataclasses import dataclass
+from typing import NamedTuple
 
 import flax
 import flax.linen as nn
@@ -28,9 +30,11 @@ import wandb
 from brax import envs
 from flax.training.train_state import TrainState
 
-from buffer import TrajectoryUniformSamplingQueue, flatten_crl_fn
+# NOTE: flatten_crl_fn is a *static method* on the class, NOT a module export.
+from buffer import TrajectoryUniformSamplingQueue
 from evaluator import CrlEvaluator
 from cost_utils import get_wall_centers, hybrid_cost
+
 
 # ═══════════════════════════════════════════════════════════════
 #  Configuration
@@ -39,10 +43,10 @@ from cost_utils import get_wall_centers, hybrid_cost
 @dataclass
 class Args:
     # ── Original CRL args ──────────────────────────────────────
-    env_id: str = "humanoid"
+    env_id: str = "ant_big_maze"
     eval_env_id: str = ""
     episode_length: int = 1000
-    total_env_steps: int = 100000000
+    total_env_steps: int = 100_000_000
     num_epochs: int = 100
     num_envs: int = 512
     eval_envs: int = 128
@@ -53,11 +57,9 @@ class Args:
     num_update_epochs: int = 4
     seed: int = 0
     batch_size: int = 256
-    num_evals: int = 10
     normalize_observations: bool = False
-    max_replay_size: int = 10000
-    min_replay_size: int = 8192
-    grad_updates_per_step: float = 1.0
+    max_replay_size: int = 10_000
+    min_replay_size: int = 8_192
     deterministic_eval: bool = True
     actor_lr: float = 3e-4
     critic_lr: float = 3e-4
@@ -76,62 +78,52 @@ class Args:
     vis_length: int = 200
     save_buffer: int = 0
     track: bool = True
-    wandb_project: str = "scaling-crl"
+    wandb_project: str = "constrained-crl"
     wandb_entity: str = ""
     wandb_group: str = ""
 
     # ── Constrained CRL additions ──────────────────────────────
-    # Toggle the constraint machinery on/off
     use_constraints: bool = True
-    # Hybrid cost parameters: c = α·1{contact} + (1-α)·exp(-d/σ)
+    # Hybrid cost: c = α·1{collision} + (1-α)·exp(-d/σ)
     alpha_cost: float = 0.5
     sigma_wall: float = 1.0
     contact_threshold: float = 0.1
     # CMDP budget & Lagrange multiplier
-    cost_budget_d: float = 0.1        # per-step cost budget d
-    lambda_init: float = 0.0          # initial Lagrange multiplier
-    lambda_lr: float = 1e-3           # dual ascent step size
-    lambda_max: float = 100.0         # clamp to prevent blow-up
+    cost_budget_d: float = 0.1
+    lambda_init: float = 0.0
+    lambda_lr: float = 1e-3
+    lambda_max: float = 100.0
     # Cost critic architecture
     cost_critic_lr: float = 3e-4
     cost_critic_width: int = 256
     cost_critic_depth: int = 4
     cost_critic_skip_connections: int = 0
-    cost_critic_tau: float = 0.005    # Polyak averaging coefficient
-    cost_discount: float = 0.99       # γ_c for cost Bellman backup
-    # Whether to use the contrastive critic's repr or raw (s,a) for cost critic
-    cost_critic_use_repr: bool = False
+    cost_critic_tau: float = 0.005   # Polyak
+    cost_discount: float = 0.99      # γ_c for Bellman backup
 
 
 # ═══════════════════════════════════════════════════════════════
-#  Network building blocks
+#  Network building blocks  (verbatim from upstream)
 # ═══════════════════════════════════════════════════════════════
 
-lecun_unfirom = nn.initializers.lecun_normal()  # sic — matches upstream typo
+lecun_unfirom = nn.initializers.lecun_normal()  # sic — preserves upstream typo
 bias_init = nn.initializers.zeros
 
 
 def residual_block(x, width, normalize, activation):
-    """4-Dense residual block with LayerNorm + Swish, matching upstream."""
     identity = x
     x = nn.Dense(width, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
-    x = normalize(x)
-    x = activation(x)
+    x = normalize(x); x = activation(x)
     x = nn.Dense(width, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
-    x = normalize(x)
-    x = activation(x)
+    x = normalize(x); x = activation(x)
     x = nn.Dense(width, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
-    x = normalize(x)
-    x = activation(x)
+    x = normalize(x); x = activation(x)
     x = nn.Dense(width, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
-    x = normalize(x)
-    x = activation(x)
-    x = x + identity
-    return x
+    x = normalize(x); x = activation(x)
+    return x + identity
 
 
 class SA_encoder(nn.Module):
-    """Contrastive (s,a) encoder — unchanged from upstream."""
     network_width: int = 1024
     network_depth: int = 4
     skip_connections: int = 0
@@ -141,37 +133,20 @@ class SA_encoder(nn.Module):
         normalize = nn.LayerNorm()
         activation = nn.swish
         x = jnp.concatenate([s, a], axis=-1)
-        x = nn.Dense(self.network_width, kernel_init=lecun_unfirom,
-                      bias_init=bias_init)(x)
-        x = normalize(x)
-        x = activation(x)
+        x = nn.Dense(self.network_width, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
+        x = normalize(x); x = activation(x)
         for i in range(self.network_depth // 4):
-            if self.skip_connections > 0 and i >= (
-                    self.network_depth // 4 - self.skip_connections):
+            if self.skip_connections > 0 and i >= (self.network_depth // 4 - self.skip_connections):
                 x = residual_block(x, self.network_width, normalize, activation)
             else:
-                x = nn.Dense(self.network_width, kernel_init=lecun_unfirom,
-                              bias_init=bias_init)(x)
-                x = normalize(x)
-                x = activation(x)
-                x = nn.Dense(self.network_width, kernel_init=lecun_unfirom,
-                              bias_init=bias_init)(x)
-                x = normalize(x)
-                x = activation(x)
-                x = nn.Dense(self.network_width, kernel_init=lecun_unfirom,
-                              bias_init=bias_init)(x)
-                x = normalize(x)
-                x = activation(x)
-                x = nn.Dense(self.network_width, kernel_init=lecun_unfirom,
-                              bias_init=bias_init)(x)
-                x = normalize(x)
-                x = activation(x)
+                for _ in range(4):
+                    x = nn.Dense(self.network_width, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
+                    x = normalize(x); x = activation(x)
         x = nn.Dense(64, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
         return x
 
 
 class G_encoder(nn.Module):
-    """Goal encoder — unchanged from upstream."""
     network_width: int = 1024
     network_depth: int = 4
     skip_connections: int = 0
@@ -181,37 +156,20 @@ class G_encoder(nn.Module):
         normalize = nn.LayerNorm()
         activation = nn.swish
         x = g
-        x = nn.Dense(self.network_width, kernel_init=lecun_unfirom,
-                      bias_init=bias_init)(x)
-        x = normalize(x)
-        x = activation(x)
+        x = nn.Dense(self.network_width, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
+        x = normalize(x); x = activation(x)
         for i in range(self.network_depth // 4):
-            if self.skip_connections > 0 and i >= (
-                    self.network_depth // 4 - self.skip_connections):
+            if self.skip_connections > 0 and i >= (self.network_depth // 4 - self.skip_connections):
                 x = residual_block(x, self.network_width, normalize, activation)
             else:
-                x = nn.Dense(self.network_width, kernel_init=lecun_unfirom,
-                              bias_init=bias_init)(x)
-                x = normalize(x)
-                x = activation(x)
-                x = nn.Dense(self.network_width, kernel_init=lecun_unfirom,
-                              bias_init=bias_init)(x)
-                x = normalize(x)
-                x = activation(x)
-                x = nn.Dense(self.network_width, kernel_init=lecun_unfirom,
-                              bias_init=bias_init)(x)
-                x = normalize(x)
-                x = activation(x)
-                x = nn.Dense(self.network_width, kernel_init=lecun_unfirom,
-                              bias_init=bias_init)(x)
-                x = normalize(x)
-                x = activation(x)
+                for _ in range(4):
+                    x = nn.Dense(self.network_width, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
+                    x = normalize(x); x = activation(x)
         x = nn.Dense(64, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
         return x
 
 
 class Actor(nn.Module):
-    """SAC-style stochastic actor — unchanged from upstream."""
     action_size: int = 8
     network_width: int = 1024
     network_depth: int = 4
@@ -221,35 +179,17 @@ class Actor(nn.Module):
     def __call__(self, x):
         normalize = nn.LayerNorm()
         activation = nn.swish
-        x = nn.Dense(self.network_width, kernel_init=lecun_unfirom,
-                      bias_init=bias_init)(x)
-        x = normalize(x)
-        x = activation(x)
+        x = nn.Dense(self.network_width, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
+        x = normalize(x); x = activation(x)
         for i in range(self.network_depth // 4):
-            if self.skip_connections > 0 and i >= (
-                    self.network_depth // 4 - self.skip_connections):
+            if self.skip_connections > 0 and i >= (self.network_depth // 4 - self.skip_connections):
                 x = residual_block(x, self.network_width, normalize, activation)
             else:
-                x = nn.Dense(self.network_width, kernel_init=lecun_unfirom,
-                              bias_init=bias_init)(x)
-                x = normalize(x)
-                x = activation(x)
-                x = nn.Dense(self.network_width, kernel_init=lecun_unfirom,
-                              bias_init=bias_init)(x)
-                x = normalize(x)
-                x = activation(x)
-                x = nn.Dense(self.network_width, kernel_init=lecun_unfirom,
-                              bias_init=bias_init)(x)
-                x = normalize(x)
-                x = activation(x)
-                x = nn.Dense(self.network_width, kernel_init=lecun_unfirom,
-                              bias_init=bias_init)(x)
-                x = normalize(x)
-                x = activation(x)
-        means = nn.Dense(self.action_size, kernel_init=lecun_unfirom,
-                         bias_init=bias_init)(x)
-        log_stds = nn.Dense(self.action_size, kernel_init=lecun_unfirom,
-                            bias_init=bias_init)(x)
+                for _ in range(4):
+                    x = nn.Dense(self.network_width, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
+                    x = normalize(x); x = activation(x)
+        means = nn.Dense(self.action_size, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
+        log_stds = nn.Dense(self.action_size, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
         log_stds = jnp.clip(log_stds, -5, 2)
         return means, log_stds
 
@@ -257,11 +197,7 @@ class Actor(nn.Module):
 # ── NEW: Cost Critic ──────────────────────────────────────────
 
 class CostCritic(nn.Module):
-    """Q_c(s, a, g) → scalar cost-to-go estimate.
-
-    Same residual architecture as SA_encoder but takes (s, a, g) and
-    outputs a single scalar (no contrastive structure).
-    """
+    """Q_c(s, a, g) → scalar.  Same residual architecture as SA_encoder."""
     network_width: int = 256
     network_depth: int = 4
     skip_connections: int = 0
@@ -271,38 +207,21 @@ class CostCritic(nn.Module):
         normalize = nn.LayerNorm()
         activation = nn.swish
         x = jnp.concatenate([s, a, g], axis=-1)
-        x = nn.Dense(self.network_width, kernel_init=lecun_unfirom,
-                      bias_init=bias_init)(x)
-        x = normalize(x)
-        x = activation(x)
+        x = nn.Dense(self.network_width, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
+        x = normalize(x); x = activation(x)
         for i in range(self.network_depth // 4):
-            if self.skip_connections > 0 and i >= (
-                    self.network_depth // 4 - self.skip_connections):
+            if self.skip_connections > 0 and i >= (self.network_depth // 4 - self.skip_connections):
                 x = residual_block(x, self.network_width, normalize, activation)
             else:
-                x = nn.Dense(self.network_width, kernel_init=lecun_unfirom,
-                              bias_init=bias_init)(x)
-                x = normalize(x)
-                x = activation(x)
-                x = nn.Dense(self.network_width, kernel_init=lecun_unfirom,
-                              bias_init=bias_init)(x)
-                x = normalize(x)
-                x = activation(x)
-                x = nn.Dense(self.network_width, kernel_init=lecun_unfirom,
-                              bias_init=bias_init)(x)
-                x = normalize(x)
-                x = activation(x)
-                x = nn.Dense(self.network_width, kernel_init=lecun_unfirom,
-                              bias_init=bias_init)(x)
-                x = normalize(x)
-                x = activation(x)
-        # Single scalar output
+                for _ in range(4):
+                    x = nn.Dense(self.network_width, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
+                    x = normalize(x); x = activation(x)
         x = nn.Dense(1, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
         return x.squeeze(-1)
 
 
 # ═══════════════════════════════════════════════════════════════
-#  Transition & TrainingState
+#  Transition and TrainingState
 # ═══════════════════════════════════════════════════════════════
 
 class Transition(NamedTuple):
@@ -315,30 +234,30 @@ class Transition(NamedTuple):
 
 @flax.struct.dataclass
 class TrainingState:
-    """Extended training state with cost critic and Lagrange multiplier."""
     env_steps: jnp.ndarray
     gradient_steps: jnp.ndarray
     actor_state: TrainState
     critic_state: TrainState
     alpha_state: TrainState
-    # ── New fields ────────────────────────────────────────────
-    cost_critic_state: TrainState          # online cost critic
-    cost_critic_target_params: dict        # Polyak-averaged target params
-    log_lambda: jnp.ndarray               # log(λ) for dual ascent
+    # Constraint additions
+    cost_critic_state: TrainState
+    cost_critic_target_params: dict
+    log_lambda: jnp.ndarray
 
 
 # ═══════════════════════════════════════════════════════════════
-#  Main training function
+#  Main
 # ═══════════════════════════════════════════════════════════════
 
 def main(args: Args):
+
     # ── Wandb ──────────────────────────────────────────────────
-    run_name = f"{args.env_id}_constrained_{args.seed}_{int(time.time())}"
+    run_name = (f"{args.env_id}_ccrl_s{args.seed}_{int(time.time())}")
     if args.track:
         wandb.init(
             project=args.wandb_project,
-            entity=args.wandb_entity if args.wandb_entity else None,
-            group=args.wandb_group if args.wandb_group else None,
+            entity=args.wandb_entity or None,
+            group=args.wandb_group or None,
             config=vars(args),
             name=run_name,
         )
@@ -348,24 +267,31 @@ def main(args: Args):
     rng, env_key, eval_key, buf_key = jax.random.split(rng, 4)
 
     # ── Environment ────────────────────────────────────────────
-    env = envs.get_environment(args.env_id)
+    # Use brax's training wrapper so state.info["state_extras"] is populated.
+    # This gives us seed (episode ID) and truncation flags that flatten_crl_fn needs.
+    raw_env = envs.get_environment(args.env_id)
+    env = envs.training.wrap(
+        raw_env,
+        episode_length=args.episode_length,
+        action_repeat=args.action_repeat,
+    )
     eval_env_id = args.eval_env_id if args.eval_env_id else args.env_id
     eval_env = envs.get_environment(eval_env_id)
 
-    action_size = env.action_size
-    obs_size = args.obs_dim + (args.goal_end_idx - args.goal_start_idx)
+    action_size = raw_env.action_size
+    goal_dim = args.goal_end_idx - args.goal_start_idx
+    obs_size = args.obs_dim + goal_dim
 
-    # ── Cost geometry (walls) ──────────────────────────────────
+    # ── Wall geometry (for cost computation) ───────────────────
     if args.use_constraints:
         wall_centers, half_wall_size = get_wall_centers(args.env_id)
     else:
-        wall_centers = jnp.zeros((1, 2))
+        wall_centers = jnp.zeros((1, 2), dtype=jnp.float32)
         half_wall_size = 1.0
 
-    # ── Network init ───────────────────────────────────────────
+    # ── Networks ───────────────────────────────────────────────
     rng, actor_key, sa_key, g_key, cost_key = jax.random.split(rng, 5)
 
-    # Contrastive critic
     sa_encoder = SA_encoder(
         network_width=args.critic_network_width,
         network_depth=args.critic_depth,
@@ -376,16 +302,8 @@ def main(args: Args):
         network_depth=args.critic_depth,
         skip_connections=args.critic_skip_connections,
     )
-
-    sa_encoder_params = sa_encoder.init(
-        sa_key,
-        np.ones([1, args.obs_dim]),
-        np.ones([1, action_size]),
-    )
-    g_encoder_params = g_encoder.init(
-        g_key,
-        np.ones([1, args.goal_end_idx - args.goal_start_idx]),
-    )
+    sa_encoder_params = sa_encoder.init(sa_key, np.ones([1, args.obs_dim]), np.ones([1, action_size]))
+    g_encoder_params  = g_encoder.init(g_key,  np.ones([1, goal_dim]))
 
     critic_state = TrainState.create(
         apply_fn=None,
@@ -393,7 +311,6 @@ def main(args: Args):
         tx=optax.adam(learning_rate=args.critic_lr),
     )
 
-    # Actor
     actor = Actor(
         action_size=action_size,
         network_width=args.actor_network_width,
@@ -406,21 +323,18 @@ def main(args: Args):
         tx=optax.adam(learning_rate=args.actor_lr),
     )
 
-    # SAC temperature
-    log_alpha_init = jnp.array(0.0, dtype=jnp.float32)
+    log_alpha_init = jnp.zeros((), dtype=jnp.float32)
     alpha_state = TrainState.create(
         apply_fn=None,
         params=log_alpha_init,
         tx=optax.adam(learning_rate=args.alpha_lr),
     )
 
-    # ── Cost critic ────────────────────────────────────────────
     cost_critic = CostCritic(
         network_width=args.cost_critic_width,
         network_depth=args.cost_critic_depth,
         skip_connections=args.cost_critic_skip_connections,
     )
-    goal_dim = args.goal_end_idx - args.goal_start_idx
     cost_critic_params = cost_critic.init(
         cost_key,
         np.ones([1, args.obs_dim]),
@@ -434,10 +348,8 @@ def main(args: Args):
     )
     cost_critic_target_params = jax.tree.map(jnp.copy, cost_critic_params)
 
-    # ── Lagrange multiplier (log-space) ────────────────────────
     log_lambda = jnp.log(jnp.maximum(args.lambda_init, 1e-8))
 
-    # ── Training state ─────────────────────────────────────────
     training_state = TrainingState(
         env_steps=jnp.zeros(()),
         gradient_steps=jnp.zeros(()),
@@ -450,46 +362,56 @@ def main(args: Args):
     )
 
     # ── Replay buffer ──────────────────────────────────────────
-    dummy_obs = jnp.zeros((obs_size,))
-    dummy_action = jnp.zeros((action_size,))
+    # Dummy transition MUST match the extras structure we'll store at collection
+    # time (after flatten_crl_fn is applied the structure changes, but the buffer
+    # stores the raw collected format).
     dummy_transition = Transition(
-        observation=dummy_obs,
-        action=dummy_action,
+        observation=jnp.zeros(obs_size),
+        action=jnp.zeros(action_size),
         reward=jnp.zeros(()),
         discount=jnp.zeros(()),
         extras={
-            "state": jnp.zeros((args.obs_dim,)),
-            "future_state": jnp.zeros((args.obs_dim,)),
-            "future_action": jnp.zeros((action_size,)),
+            "state_extras": {
+                "seed": jnp.zeros(()),
+                "truncation": jnp.zeros(()),
+            },
+            "state": jnp.zeros(args.obs_dim),
         },
     )
 
     replay_buffer = TrajectoryUniformSamplingQueue(
         max_replay_size=args.max_replay_size,
         dummy_data_sample=dummy_transition,
-        sample_batch_size=args.batch_size * args.num_minibatches
-                          * args.num_update_epochs,
+        sample_batch_size=args.batch_size * args.num_minibatches * args.num_update_epochs,
         num_envs=args.num_envs,
         episode_length=args.episode_length,
     )
     buffer_state = replay_buffer.init(buf_key)
 
     # ── Evaluator ──────────────────────────────────────────────
+    # actor_step must match: (training_state, env, env_state, extra_fields) -> (env_state, transition)
+    def actor_step(training_state, env, env_state, extra_fields=()):
+        obs = env_state.obs
+        state = obs[:, :args.obs_dim]
+        goal  = obs[:, args.obs_dim:]
+        observation = jnp.concatenate([state, goal], axis=1)
+        means, _ = actor.apply(training_state.actor_state.params, observation)
+        actions = nn.tanh(means)                  # deterministic for eval
+        next_env_state = env.step(env_state, actions)
+        transition = Transition(
+            observation=obs,
+            action=actions,
+            reward=next_env_state.reward,
+            discount=1.0 - next_env_state.done,
+            extras={},
+        )
+        return next_env_state, transition
+
     evaluator = CrlEvaluator(
-        eval_env,
-        lambda params, obs: {
-            "sa_encoder": sa_encoder,
-            "g_encoder": g_encoder,
-            "actor": actor,
-            "params": params,
-            "obs_dim": args.obs_dim,
-            "goal_start_idx": args.goal_start_idx,
-            "goal_end_idx": args.goal_end_idx,
-            "deterministic": args.deterministic_eval,
-        },
+        actor_step=actor_step,
+        eval_env=eval_env,
         num_eval_envs=args.eval_envs,
         episode_length=args.episode_length,
-        action_repeat=args.action_repeat,
         key=eval_key,
     )
 
@@ -499,45 +421,35 @@ def main(args: Args):
 
     def critic_loss_fn(critic_params, transitions, key):
         """InfoNCE contrastive loss — unchanged from upstream."""
-        sa_encoder_params = critic_params["sa_encoder"]
-        g_encoder_params = critic_params["g_encoder"]
-
-        obs = transitions.observation
-        action = transitions.action
+        sa_enc_p = critic_params["sa_encoder"]
+        g_enc_p  = critic_params["g_encoder"]
+        obs          = transitions.observation
+        action       = transitions.action
         future_state = transitions.extras["future_state"]
-        goal = future_state[:, args.goal_start_idx:args.goal_end_idx]
+        goal         = future_state[:, args.goal_start_idx:args.goal_end_idx]
 
-        sa_repr = sa_encoder.apply(sa_encoder_params, obs[:, :args.obs_dim], action)
-        g_repr = g_encoder.apply(g_encoder_params, goal)
+        sa_repr = sa_encoder.apply(sa_enc_p, obs[:, :args.obs_dim], action)
+        g_repr  = g_encoder.apply(g_enc_p, goal)
 
-        logits = -jnp.sqrt(
-            jnp.sum((sa_repr[:, None, :] - g_repr[None, :, :]) ** 2, axis=-1)
-        )
-        # InfoNCE
-        logsumexp = jax.nn.logsumexp(logits, axis=1)
-        critic_loss = -jnp.mean(jnp.diag(logits) - logsumexp)
-        # Logsumexp penalty
-        critic_loss += args.logsumexp_penalty_coeff * jnp.mean(logsumexp ** 2)
+        logits = -jnp.sqrt(jnp.sum((sa_repr[:, None, :] - g_repr[None, :, :]) ** 2, axis=-1))
+        logsumexp_val = jax.nn.logsumexp(logits, axis=1)
+        loss = -jnp.mean(jnp.diag(logits) - logsumexp_val)
+        loss += args.logsumexp_penalty_coeff * jnp.mean(logsumexp_val ** 2)
 
         I = jnp.eye(logits.shape[0])
-        correct = jnp.argmax(logits, axis=1) == jnp.argmax(I, axis=1)
-        logits_pos = jnp.sum(logits * I) / jnp.sum(I)
+        correct  = jnp.argmax(logits, axis=1) == jnp.argmax(I, axis=1)
+        logits_pos = jnp.sum(logits * I)       / jnp.sum(I)
         logits_neg = jnp.sum(logits * (1 - I)) / jnp.sum(1 - I)
-
-        return critic_loss, (logits_pos, logits_neg, jnp.mean(correct),
-                             jnp.mean(logsumexp))
+        return loss, (logits_pos, logits_neg, jnp.mean(correct), jnp.mean(logsumexp_val))
 
     def actor_loss_fn(actor_params, critic_params, log_alpha,
                       cost_critic_params, log_lam, transitions, key):
-        """Lagrangian actor loss: E[α·log π - Q + λ·Q_c].
-
-        When args.use_constraints is False the λ·Q_c term is zero.
-        """
-        obs = transitions.observation
+        """Lagrangian actor loss: E[α_sac·log π  -  Q  +  λ·Q_c]."""
+        obs          = transitions.observation
         future_state = transitions.extras["future_state"]
-        state = obs[:, :args.obs_dim]
-        goal = future_state[:, args.goal_start_idx:args.goal_end_idx]
-        observation = jnp.concatenate([state, goal], axis=1)
+        state        = obs[:, :args.obs_dim]
+        goal         = future_state[:, args.goal_start_idx:args.goal_end_idx]
+        observation  = jnp.concatenate([state, goal], axis=1)
 
         means, log_stds = actor.apply(actor_params, observation)
         stds = jnp.exp(log_stds)
@@ -547,21 +459,16 @@ def main(args: Args):
         log_prob -= jnp.log((1 - jnp.square(action)) + 1e-6)
         log_prob = log_prob.sum(-1)
 
-        # Contrastive Q-value
-        sa_encoder_params = critic_params["sa_encoder"]
-        g_encoder_params = critic_params["g_encoder"]
-        sa_repr = sa_encoder.apply(sa_encoder_params, state, action)
-        g_repr = g_encoder.apply(g_encoder_params, goal)
-        qf_pi = -jnp.sqrt(jnp.sum((sa_repr - g_repr) ** 2, axis=-1))
+        sa_repr = sa_encoder.apply(critic_params["sa_encoder"], state, action)
+        g_repr  = g_encoder.apply(critic_params["g_encoder"],  goal)
+        qf_pi   = -jnp.sqrt(jnp.sum((sa_repr - g_repr) ** 2, axis=-1))
 
-        # Base SAC actor loss
-        alpha = jnp.exp(log_alpha)
+        alpha      = jnp.exp(log_alpha)
         actor_loss = jnp.mean(alpha * log_prob - qf_pi)
 
-        # ── Lagrangian penalty ─────────────────────────────────
         if args.use_constraints:
-            lam = jnp.exp(log_lam)
-            qc_pi = cost_critic.apply(cost_critic_params, state, action, goal)
+            lam    = jnp.exp(log_lam)
+            qc_pi  = cost_critic.apply(cost_critic_params, state, action, goal)
             actor_loss = actor_loss + jnp.mean(lam * qc_pi)
         else:
             qc_pi = jnp.zeros_like(qf_pi)
@@ -569,32 +476,24 @@ def main(args: Args):
         return actor_loss, (log_prob, jnp.mean(qc_pi))
 
     def alpha_loss_fn(log_alpha, log_prob):
-        """SAC entropy temperature loss — unchanged."""
-        alpha_loss = -jnp.mean(log_alpha * (log_prob + action_size))
-        return alpha_loss
-
-    # ── Cost critic loss ───────────────────────────────────────
+        return -jnp.mean(log_alpha * (log_prob + action_size))
 
     def cost_critic_loss_fn(cost_critic_params, cost_critic_target_params,
-                            transitions, key):
+                            actor_params, transitions, key):
         """TD(0) Bellman loss for Q_c.
 
-        target = c(s,a,s') + γ_c · Q_c^{targ}(s', a', g)
-        where a' ~ π(·|s',g) and c is the hybrid cost from maze geometry.
+        FIX vs. old version: actor_params is now an explicit argument so the
+        loss always uses the *current* (just-updated) actor, not stale closure.
         """
-        obs = transitions.observation
-        action = transitions.action
+        obs          = transitions.observation
+        action       = transitions.action
         future_state = transitions.extras["future_state"]
-        state = obs[:, :args.obs_dim]
-        next_state_full = transitions.extras.get(
-            "state", obs[:, :args.obs_dim]
-        )  # s' approximated from replay; see note below
-        goal = future_state[:, args.goal_start_idx:args.goal_end_idx]
+        state        = obs[:, :args.obs_dim]
+        next_state   = transitions.extras["state"]   # raw s stored at collection
+        goal         = future_state[:, args.goal_start_idx:args.goal_end_idx]
 
-        # Current-state agent xy for cost computation
+        # Step cost from maze geometry (computed on current state)
         agent_xy = state[:, :2]
-
-        # Compute step cost from maze geometry
         cost, d_wall, collision = hybrid_cost(
             agent_xy, wall_centers, half_wall_size,
             alpha_cost=args.alpha_cost,
@@ -602,60 +501,45 @@ def main(args: Args):
             contact_threshold=args.contact_threshold,
         )
 
-        # Next-state action from current policy (for target)
-        next_obs = jnp.concatenate([next_state_full, goal], axis=1)
-        means_next, log_stds_next = actor.apply(
-            training_state.actor_state.params, next_obs
-        )
-        stds_next = jnp.exp(log_stds_next)
+        # Next-state action from current policy
+        next_obs = jnp.concatenate([next_state, goal], axis=1)
+        means_next, log_stds_next = actor.apply(actor_params, next_obs)
         key, subkey = jax.random.split(key)
-        x_next = means_next + stds_next * jax.random.normal(
-            subkey, shape=means_next.shape
-        )
+        x_next = means_next + jnp.exp(log_stds_next) * jax.random.normal(
+            subkey, shape=means_next.shape)
         action_next = nn.tanh(x_next)
 
-        # Target Q_c
-        qc_target = cost_critic.apply(
-            cost_critic_target_params,
-            next_state_full, action_next, goal,
-        )
-        td_target = cost + args.cost_discount * qc_target
-        td_target = jax.lax.stop_gradient(td_target)
+        qc_target = cost_critic.apply(cost_critic_target_params, next_state, action_next, goal)
+        td_target  = jax.lax.stop_gradient(cost + args.cost_discount * qc_target)
 
-        # Online Q_c
-        qc_online = cost_critic.apply(
-            cost_critic_params, state, action, goal,
-        )
+        qc_online = cost_critic.apply(cost_critic_params, state, action, goal)
         loss = jnp.mean((qc_online - td_target) ** 2)
 
         return loss, {
             "cost_critic_loss": loss,
-            "mean_step_cost": jnp.mean(cost),
-            "mean_d_wall": jnp.mean(d_wall),
-            "collision_rate": jnp.mean(collision),
-            "mean_qc": jnp.mean(qc_online),
+            "mean_step_cost":   jnp.mean(cost),
+            "mean_d_wall":      jnp.mean(d_wall),
+            "collision_rate":   jnp.mean(collision),
+            "mean_qc":          jnp.mean(qc_online),
         }
 
     # ──────────────────────────────────────────────────────────
-    #  SGD step  (one gradient update on one minibatch)
+    #  SGD step — NO @jax.jit; it lives inside jax.lax.scan
     # ──────────────────────────────────────────────────────────
 
-    @jax.jit
     def sgd_step(carry, transitions):
-        (training_state, key) = carry
+        training_state, key = carry
         key, critic_key, actor_key, cost_key = jax.random.split(key, 4)
 
-        # ── Critic update ──────────────────────────────────────
-        critic_grad_fn = jax.value_and_grad(critic_loss_fn, has_aux=True)
-        (critic_loss, (logits_pos, logits_neg, accuracy, logsumexp)), \
-            critic_grads = critic_grad_fn(
-                training_state.critic_state.params, transitions, critic_key)
-        critic_state = training_state.critic_state.apply_gradients(
-            grads=critic_grads)
+        # Critic
+        (c_loss, (lp, ln, acc, lse)), c_grads = jax.value_and_grad(
+            critic_loss_fn, has_aux=True)(
+            training_state.critic_state.params, transitions, critic_key)
+        critic_state = training_state.critic_state.apply_gradients(grads=c_grads)
 
-        # ── Actor update (Lagrangian) ──────────────────────────
-        actor_grad_fn = jax.value_and_grad(actor_loss_fn, has_aux=True)
-        (actor_loss, (log_prob, mean_qc_pi)), actor_grads = actor_grad_fn(
+        # Actor (Lagrangian)
+        (a_loss, (log_prob, mean_qc_pi)), a_grads = jax.value_and_grad(
+            actor_loss_fn, has_aux=True)(
             training_state.actor_state.params,
             critic_state.params,
             training_state.alpha_state.params,
@@ -664,61 +548,49 @@ def main(args: Args):
             transitions,
             actor_key,
         )
-        actor_state = training_state.actor_state.apply_gradients(
-            grads=actor_grads)
+        actor_state = training_state.actor_state.apply_gradients(grads=a_grads)
 
-        # ── Alpha (temperature) update ─────────────────────────
-        alpha_grad_fn = jax.value_and_grad(alpha_loss_fn)
-        alpha_loss, alpha_grads = alpha_grad_fn(
+        # Alpha
+        al_loss, al_grads = jax.value_and_grad(alpha_loss_fn)(
             training_state.alpha_state.params, log_prob)
-        alpha_state = training_state.alpha_state.apply_gradients(
-            grads=alpha_grads)
+        alpha_state = training_state.alpha_state.apply_gradients(grads=al_grads)
 
-        # ── Cost critic update ─────────────────────────────────
+        # Cost critic — FIX: pass actor_state.params (updated above)
         if args.use_constraints:
-            cost_critic_grad_fn = jax.value_and_grad(
-                cost_critic_loss_fn, has_aux=True)
-            (cc_loss, cc_metrics), cc_grads = cost_critic_grad_fn(
+            (cc_loss, cc_m), cc_grads = jax.value_and_grad(
+                cost_critic_loss_fn, has_aux=True)(
                 training_state.cost_critic_state.params,
                 training_state.cost_critic_target_params,
+                actor_state.params,           # ← updated actor params
                 transitions,
                 cost_key,
             )
-            cost_critic_state_new = training_state.cost_critic_state \
-                .apply_gradients(grads=cc_grads)
+            cost_critic_state_new = training_state.cost_critic_state.apply_gradients(
+                grads=cc_grads)
 
-            # Polyak average target params
             tau = args.cost_critic_tau
             target_params_new = jax.tree.map(
-                lambda p, tp: tau * p + (1 - tau) * tp,
+                lambda p, tp: tau * p + (1.0 - tau) * tp,
                 cost_critic_state_new.params,
                 training_state.cost_critic_target_params,
             )
 
-            # ── Dual (lambda) update ───────────────────────────
-            # λ ← max(0, λ + lr_λ · (Ĵ_c - d))
-            # In log-space: log_λ' = log(max(ε, exp(log_λ) + lr·(Ĵ_c - d)))
             lam = jnp.exp(training_state.log_lambda)
-            constraint_violation = cc_metrics["mean_step_cost"] - args.cost_budget_d
             lam_new = jnp.clip(
-                lam + args.lambda_lr * constraint_violation,
+                lam + args.lambda_lr * (cc_m["mean_step_cost"] - args.cost_budget_d),
                 1e-8, args.lambda_max,
             )
             log_lambda_new = jnp.log(lam_new)
         else:
             cost_critic_state_new = training_state.cost_critic_state
-            target_params_new = training_state.cost_critic_target_params
-            log_lambda_new = training_state.log_lambda
-            cc_metrics = {
-                "cost_critic_loss": 0.0,
-                "mean_step_cost": 0.0,
-                "mean_d_wall": 0.0,
-                "collision_rate": 0.0,
-                "mean_qc": 0.0,
-            }
+            target_params_new     = training_state.cost_critic_target_params
+            log_lambda_new        = training_state.log_lambda
+            cc_loss               = jnp.zeros(())
+            cc_m = {k: jnp.zeros(()) for k in
+                    ["cost_critic_loss", "mean_step_cost", "mean_d_wall",
+                     "collision_rate", "mean_qc"]}
 
-        # ── Assemble new state ─────────────────────────────────
-        new_training_state = TrainingState(
+        new_ts = TrainingState(
             env_steps=training_state.env_steps,
             gradient_steps=training_state.gradient_steps + 1,
             actor_state=actor_state,
@@ -730,46 +602,41 @@ def main(args: Args):
         )
 
         metrics = {
-            "critic_loss": critic_loss,
-            "actor_loss": actor_loss,
-            "alpha_loss": alpha_loss,
-            "alpha": jnp.exp(alpha_state.params),
-            "logits_pos": logits_pos,
-            "logits_neg": logits_neg,
-            "accuracy": accuracy,
-            "logsumexp": logsumexp,
-            # Cost metrics
-            "cost_critic_loss": cc_metrics["cost_critic_loss"],
-            "mean_step_cost": cc_metrics["mean_step_cost"],
-            "mean_d_wall": cc_metrics["mean_d_wall"],
-            "collision_rate": cc_metrics["collision_rate"],
-            "mean_qc": cc_metrics["mean_qc"],
-            "lambda": jnp.exp(log_lambda_new),
-            "mean_qc_pi": mean_qc_pi,
+            "critic_loss":      c_loss,
+            "actor_loss":       a_loss,
+            "alpha_loss":       al_loss,
+            "alpha":            jnp.exp(alpha_state.params),
+            "logits_pos":       lp,
+            "logits_neg":       ln,
+            "accuracy":         acc,
+            "logsumexp":        lse,
+            "cost_critic_loss": cc_m["cost_critic_loss"],
+            "mean_step_cost":   cc_m["mean_step_cost"],
+            "mean_d_wall":      cc_m["mean_d_wall"],
+            "collision_rate":   cc_m["collision_rate"],
+            "mean_qc":          cc_m["mean_qc"],
+            "lambda":           jnp.exp(log_lambda_new),
+            "mean_qc_pi":       mean_qc_pi,
         }
-
-        return (new_training_state, key), metrics
+        return (new_ts, key), metrics
 
     # ──────────────────────────────────────────────────────────
-    #  Env step  (collect rollouts → add to buffer)
+    #  Env collection step (no buffer write — done in bulk below)
     # ──────────────────────────────────────────────────────────
 
-    def env_step(carry, unused_t):
-        """One unroll step in the environment."""
-        (env_state, training_state, buffer_state, key) = carry
-        key, action_key, step_key = jax.random.split(key, 3)
+    def collect_step(carry, unused_t):
+        """One environment step.  Returns transition; buffer insert is outside."""
+        env_state, actor_params, key = carry
+        key, action_key = jax.random.split(key)
 
-        obs = env_state.obs
+        obs   = env_state.obs
         state = obs[:, :args.obs_dim]
-        # During collection, use a random goal or the env-provided goal
-        goal = obs[:, args.obs_dim:]
+        goal  = obs[:, args.obs_dim:]
         observation = jnp.concatenate([state, goal], axis=1)
 
-        means, log_stds = actor.apply(
-            training_state.actor_state.params, observation)
+        means, log_stds = actor.apply(actor_params, observation)
         stds = jnp.exp(log_stds)
-        x_ts = means + stds * jax.random.normal(
-            action_key, shape=means.shape)
+        x_ts = means + stds * jax.random.normal(action_key, shape=means.shape)
         action = nn.tanh(x_ts)
 
         next_env_state = env.step(env_state, action)
@@ -780,221 +647,228 @@ def main(args: Args):
             reward=next_env_state.reward,
             discount=1.0 - next_env_state.done,
             extras={
-                "state": obs[:, :args.obs_dim],
+                "state_extras": {
+                    # seed tracks episode ID; incremented by brax's EpisodeWrapper
+                    "seed":       next_env_state.info["state_extras"]["seed"],
+                    "truncation": next_env_state.info["state_extras"]["truncation"],
+                },
+                "state": obs[:, :args.obs_dim],  # raw state for cost critic next-step
             },
         )
-        buffer_state = replay_buffer.insert(buffer_state, transition)
-
-        return (next_env_state, training_state, buffer_state, key), transition
+        return (next_env_state, actor_params, key), transition
 
     # ──────────────────────────────────────────────────────────
-    #  Training step  (sample from buffer → multiple SGD steps)
+    #  Training step
     # ──────────────────────────────────────────────────────────
 
     def training_step(carry, unused_t):
-        (training_state, env_state, buffer_state, key) = carry
-        key, sample_key, unroll_key = jax.random.split(key, 3)
+        training_state, env_state, buffer_state, key = carry
+        key, collect_key, sample_key, perm_key = jax.random.split(key, 4)
 
-        # Collect new experience
-        (env_state, training_state, buffer_state, _), _ = jax.lax.scan(
-            env_step,
-            (env_state, training_state, buffer_state, unroll_key),
+        # 1. Collect unroll_length steps → (unroll_length, num_envs, ...)
+        (env_state, _, _), transitions = jax.lax.scan(
+            collect_step,
+            (env_state, training_state.actor_state.params, collect_key),
             (),
             length=args.unroll_length,
         )
+
+        # 2. Bulk insert into buffer (insert_internal is pure JAX, safe in scan)
+        buffer_state = replay_buffer.insert_internal(buffer_state, transitions)
 
         training_state = training_state.replace(
             env_steps=training_state.env_steps
             + args.unroll_length * args.num_envs * args.action_repeat,
         )
 
-        # Sample and reshape for minibatches
-        buffer_state, transitions = replay_buffer.sample(buffer_state)
-        transitions = flatten_crl_fn(transitions, args.gamma)
+        # 3. Sample from buffer → (num_envs, episode_length, ...)
+        buffer_state, sampled = replay_buffer.sample(buffer_state)
 
-        # Reshape into (num_update_epochs * num_minibatches, batch_size, ...)
-        transitions = jax.tree.map(
+        # 4. Apply flatten_crl_fn per trajectory (vmap over num_envs)
+        #    Signature: flatten_crl_fn(buffer_config_tuple, transition, sample_key)
+        buffer_config = (args.gamma, args.obs_dim, args.goal_start_idx, args.goal_end_idx)
+        flat_fn = functools.partial(
+            TrajectoryUniformSamplingQueue.flatten_crl_fn, buffer_config)
+        flat_keys = jax.random.split(sample_key, args.num_envs)
+        sampled = jax.vmap(flat_fn)(sampled, flat_keys)
+        # → (num_envs, episode_length-1, ...)
+
+        # 5. Flatten to (N, ...), shuffle, take first batch_total, reshape
+        batch_total = args.num_update_epochs * args.num_minibatches * args.batch_size
+        sampled = jax.tree.map(lambda x: x.reshape(-1, *x.shape[2:]), sampled)
+        n = sampled.observation.shape[0]
+        perm = jax.random.permutation(perm_key, n)
+        sampled = jax.tree.map(lambda x: x[perm[:batch_total]], sampled)
+        # → (batch_total, ...)
+
+        # 6. Reshape into (num_update_epochs * num_minibatches, batch_size, ...)
+        sampled = jax.tree.map(
             lambda x: x.reshape(
-                (args.num_update_epochs * args.num_minibatches,
-                 args.batch_size) + x.shape[1:]
+                args.num_update_epochs * args.num_minibatches,
+                args.batch_size,
+                *x.shape[1:],
             ),
-            transitions,
+            sampled,
         )
 
-        (training_state, key), sgd_metrics = jax.lax.scan(
+        # 7. Run gradient updates
+        (training_state, _), sgd_metrics = jax.lax.scan(
             sgd_step,
             (training_state, sample_key),
-            transitions,
+            sampled,
         )
 
         return (training_state, env_state, buffer_state, key), sgd_metrics
 
     # ──────────────────────────────────────────────────────────
-    #  Training epoch  (multiple training steps)
+    #  Training epoch
     # ──────────────────────────────────────────────────────────
 
     def training_epoch(carry, unused_t):
-        (training_state, env_state, buffer_state, key) = carry
-
-        # How many training_step calls per epoch
-        steps_per_epoch = (
-            args.total_env_steps
-            // (args.num_epochs
-                 * args.unroll_length
-                 * args.num_envs
-                 * args.action_repeat)
-        )
-
-        (training_state, env_state, buffer_state, key), metrics = \
-            jax.lax.scan(
-                training_step,
-                (training_state, env_state, buffer_state, key),
-                (),
-                length=steps_per_epoch,
+        steps_per_epoch = max(1,
+            args.total_env_steps // (
+                args.num_epochs * args.unroll_length
+                * args.num_envs * args.action_repeat
             )
-
+        )
+        (training_state, env_state, buffer_state, key), metrics = jax.lax.scan(
+            training_step,
+            carry,
+            (),
+            length=steps_per_epoch,
+        )
         return (training_state, env_state, buffer_state, key), metrics
+
+    # ──────────────────────────────────────────────────────────
+    #  Initial env reset and buffer prefill
+    # ──────────────────────────────────────────────────────────
+
+    rng, reset_key = jax.random.split(rng)
+    env_keys = jax.random.split(reset_key, args.num_envs)
+    env_state = env.reset(env_keys)
+
+    # Prefill buffer with random actions (outside JIT for simplicity)
+    prefill_steps = args.min_replay_size // args.num_envs + 1
+    rng, prefill_key = jax.random.split(rng)
+
+    @jax.jit
+    def prefill_one(carry, unused):
+        env_state, buffer_state, key = carry
+        key, ak = jax.random.split(key)
+        action = jax.random.uniform(ak, (args.num_envs, action_size), minval=-1.0, maxval=1.0)
+        next_env_state = env.step(env_state, action)
+        t = Transition(
+            observation=env_state.obs,
+            action=action,
+            reward=next_env_state.reward,
+            discount=1.0 - next_env_state.done,
+            extras={
+                "state_extras": {
+                    "seed":       next_env_state.info["state_extras"]["seed"],
+                    "truncation": next_env_state.info["state_extras"]["truncation"],
+                },
+                "state": env_state.obs[:, :args.obs_dim],
+            },
+        )
+        buffer_state = replay_buffer.insert_internal(buffer_state, t[None])  # add unroll dim=1
+        return (next_env_state, buffer_state, key), ()
+
+    (env_state, buffer_state, _), _ = jax.lax.scan(
+        prefill_one, (env_state, buffer_state, prefill_key), (), length=prefill_steps)
+    print(f"Buffer prefilled with ~{prefill_steps * args.num_envs} transitions.")
+    print(f"Starting {args.num_epochs} epochs.  Constraints: {args.use_constraints}")
+    if args.use_constraints:
+        print(f"  budget={args.cost_budget_d}  α_cost={args.alpha_cost}  σ={args.sigma_wall}")
 
     # ──────────────────────────────────────────────────────────
     #  Main training loop
     # ──────────────────────────────────────────────────────────
 
-    # Reset environment
-    rng, env_reset_key = jax.random.split(rng)
-    env_keys = jax.random.split(env_reset_key, args.num_envs)
-    env_state = jax.vmap(env.reset)(env_keys)
-
-    # Prefill buffer with random actions
-    rng, prefill_key = jax.random.split(rng)
-
-    def prefill_step(carry, unused):
-        env_state, buffer_state, key = carry
-        key, action_key, step_key = jax.random.split(key, 3)
-        action = jax.random.uniform(
-            action_key, (args.num_envs, action_size),
-            minval=-1.0, maxval=1.0,
-        )
-        next_env_state = env.step(env_state, action)
-        transition = Transition(
-            observation=env_state.obs,
-            action=action,
-            reward=next_env_state.reward,
-            discount=1.0 - next_env_state.done,
-            extras={"state": env_state.obs[:, :args.obs_dim]},
-        )
-        buffer_state = replay_buffer.insert(buffer_state, transition)
-        return (next_env_state, buffer_state, key), ()
-
-    prefill_length = args.min_replay_size // args.num_envs + 1
-    (env_state, buffer_state, _), _ = jax.lax.scan(
-        prefill_step,
-        (env_state, buffer_state, prefill_key),
-        (),
-        length=prefill_length,
-    )
-
-    print(f"Prefilled buffer with {prefill_length * args.num_envs} transitions")
-    print(f"Starting training for {args.num_epochs} epochs...")
-    if args.use_constraints:
-        print(f"  Constraints ON: budget={args.cost_budget_d}, "
-              f"α_cost={args.alpha_cost}, σ_wall={args.sigma_wall}")
-
-    # JIT-compile the training epoch
-    jit_training_epoch = jax.jit(training_epoch)
+    jit_epoch = jax.jit(training_epoch)
 
     for epoch in range(args.num_epochs):
         t0 = time.time()
 
-        (training_state, env_state, buffer_state, rng), epoch_metrics = \
-            jit_training_epoch(
-                (training_state, env_state, buffer_state, rng), ()
-            )
+        (training_state, env_state, buffer_state, rng), epoch_metrics = jit_epoch(
+            (training_state, env_state, buffer_state, rng), ()
+        )
 
-        epoch_time = time.time() - t0
-        env_steps = int(training_state.env_steps)
+        dur = time.time() - t0
+        env_steps  = int(training_state.env_steps)
         grad_steps = int(training_state.gradient_steps)
 
-        # ── Evaluation ─────────────────────────────────────────
+        # Evaluation every eval_every epochs
+        eval_metrics = {}
         if (epoch + 1) % args.eval_every == 0:
-            eval_params = {
-                "actor": training_state.actor_state.params,
-                "sa_encoder": training_state.critic_state.params["sa_encoder"],
-                "g_encoder": training_state.critic_state.params["g_encoder"],
-            }
-            # Note: evaluator interface depends on the CrlEvaluator implementation
-            # This is a placeholder — adapt to the actual evaluator API
-            # eval_metrics = evaluator.run_evaluation(eval_params, {})
+            eval_metrics = evaluator.run_evaluation(training_state, {})
 
-        # ── Logging ────────────────────────────────────────────
-        # Average metrics over the epoch
         log_dict = {
             "epoch": epoch,
             "env_steps": env_steps,
             "gradient_steps": grad_steps,
-            "epoch_time": epoch_time,
-            "steps_per_sec": (args.total_env_steps / args.num_epochs) / max(epoch_time, 1e-6),
+            "epoch_time_s": dur,
             # Critic
             "critic_loss": float(jnp.mean(epoch_metrics["critic_loss"])),
-            "accuracy": float(jnp.mean(epoch_metrics["accuracy"])),
-            "logits_pos": float(jnp.mean(epoch_metrics["logits_pos"])),
-            "logits_neg": float(jnp.mean(epoch_metrics["logits_neg"])),
-            "logsumexp": float(jnp.mean(epoch_metrics["logsumexp"])),
-            # Actor
-            "actor_loss": float(jnp.mean(epoch_metrics["actor_loss"])),
-            "alpha": float(jnp.mean(epoch_metrics["alpha"])),
-            "alpha_loss": float(jnp.mean(epoch_metrics["alpha_loss"])),
+            "accuracy":    float(jnp.mean(epoch_metrics["accuracy"])),
+            "logits_pos":  float(jnp.mean(epoch_metrics["logits_pos"])),
+            "logits_neg":  float(jnp.mean(epoch_metrics["logits_neg"])),
+            "logsumexp":   float(jnp.mean(epoch_metrics["logsumexp"])),
+            # Actor / entropy
+            "actor_loss":  float(jnp.mean(epoch_metrics["actor_loss"])),
+            "alpha":       float(jnp.mean(epoch_metrics["alpha"])),
+            "alpha_loss":  float(jnp.mean(epoch_metrics["alpha_loss"])),
+            **eval_metrics,
         }
 
         if args.use_constraints:
             log_dict.update({
-                # Cost
                 "cost_critic_loss": float(jnp.mean(epoch_metrics["cost_critic_loss"])),
-                "mean_step_cost": float(jnp.mean(epoch_metrics["mean_step_cost"])),
-                "mean_d_wall": float(jnp.mean(epoch_metrics["mean_d_wall"])),
-                "collision_rate": float(jnp.mean(epoch_metrics["collision_rate"])),
-                "mean_qc": float(jnp.mean(epoch_metrics["mean_qc"])),
-                "mean_qc_pi": float(jnp.mean(epoch_metrics["mean_qc_pi"])),
-                "lambda": float(jnp.mean(epoch_metrics["lambda"])),
+                "mean_step_cost":   float(jnp.mean(epoch_metrics["mean_step_cost"])),
+                "mean_d_wall":      float(jnp.mean(epoch_metrics["mean_d_wall"])),
+                "collision_rate":   float(jnp.mean(epoch_metrics["collision_rate"])),
+                "mean_qc":          float(jnp.mean(epoch_metrics["mean_qc"])),
+                "mean_qc_pi":       float(jnp.mean(epoch_metrics["mean_qc_pi"])),
+                "lambda":           float(jnp.mean(epoch_metrics["lambda"])),
             })
 
-        print(f"Epoch {epoch+1}/{args.num_epochs}  |  "
-              f"steps={env_steps:,}  |  "
-              f"critic_loss={log_dict['critic_loss']:.4f}  |  "
-              f"actor_loss={log_dict['actor_loss']:.4f}  |  "
-              f"accuracy={log_dict['accuracy']:.3f}  |  "
-              f"time={epoch_time:.1f}s")
+        print(
+            f"[{epoch+1:3d}/{args.num_epochs}] steps={env_steps:,} | "
+            f"c_loss={log_dict['critic_loss']:.4f} acc={log_dict['accuracy']:.3f} | "
+            f"a_loss={log_dict['actor_loss']:.4f} | "
+            f"t={dur:.1f}s"
+        )
         if args.use_constraints:
-            print(f"  COST: collision_rate={log_dict['collision_rate']:.4f}  |  "
-                  f"mean_cost={log_dict['mean_step_cost']:.4f}  |  "
-                  f"lambda={log_dict['lambda']:.4f}  |  "
-                  f"qc={log_dict['mean_qc']:.4f}")
+            print(
+                f"         collisions={log_dict['collision_rate']:.4f} "
+                f"cost={log_dict['mean_step_cost']:.4f} "
+                f"λ={log_dict['lambda']:.4f} "
+                f"Qc={log_dict['mean_qc']:.4f}"
+            )
 
         if args.track:
             wandb.log(log_dict, step=env_steps)
 
-    # ── Save checkpoint ────────────────────────────────────────
+    # ── Checkpoint ─────────────────────────────────────────────
     ckpt_dir = f"checkpoints/{run_name}"
     os.makedirs(ckpt_dir, exist_ok=True)
     ckpt = {
-        "actor_params": training_state.actor_state.params,
+        "actor_params":  training_state.actor_state.params,
         "critic_params": training_state.critic_state.params,
-        "alpha_params": training_state.alpha_state.params,
+        "alpha_params":  training_state.alpha_state.params,
     }
     if args.use_constraints:
         ckpt.update({
-            "cost_critic_params": training_state.cost_critic_state.params,
+            "cost_critic_params":        training_state.cost_critic_state.params,
             "cost_critic_target_params": training_state.cost_critic_target_params,
-            "log_lambda": training_state.log_lambda,
+            "log_lambda":                training_state.log_lambda,
         })
     with open(f"{ckpt_dir}/params.pkl", "wb") as f:
         pickle.dump(ckpt, f)
-    print(f"Checkpoint saved to {ckpt_dir}/params.pkl")
+    print(f"Checkpoint saved → {ckpt_dir}/params.pkl")
 
-    # ── Save buffer (optional) ─────────────────────────────────
     if args.save_buffer:
         with open(f"{ckpt_dir}/buffer.pkl", "wb") as f:
             pickle.dump(buffer_state, f)
-        print(f"Buffer saved to {ckpt_dir}/buffer.pkl")
 
     if args.track:
         wandb.finish()
