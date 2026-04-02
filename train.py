@@ -346,7 +346,7 @@ def main(args: Args):
         params=cost_critic_params,
         tx=optax.adam(learning_rate=args.cost_critic_lr),
     )
-    cost_critic_target_params = jax.tree.map(jnp.copy, cost_critic_params)
+    cost_critic_target_params = jax.tree_util.tree_map(jnp.copy, cost_critic_params)
 
     log_lambda = jnp.log(jnp.maximum(args.lambda_init, 1e-8))
 
@@ -569,7 +569,7 @@ def main(args: Args):
                 grads=cc_grads)
 
             tau = args.cost_critic_tau
-            target_params_new = jax.tree.map(
+            target_params_new = jax.tree_util.tree_map(
                 lambda p, tp: tau * p + (1.0 - tau) * tp,
                 cost_critic_state_new.params,
                 training_state.cost_critic_target_params,
@@ -695,14 +695,14 @@ def main(args: Args):
 
         # 5. Flatten to (N, ...), shuffle, take first batch_total, reshape
         batch_total = args.num_update_epochs * args.num_minibatches * args.batch_size
-        sampled = jax.tree.map(lambda x: x.reshape(-1, *x.shape[2:]), sampled)
+        sampled = jax.tree_util.tree_map(lambda x: x.reshape(-1, *x.shape[2:]), sampled)
         n = sampled.observation.shape[0]
         perm = jax.random.permutation(perm_key, n)
-        sampled = jax.tree.map(lambda x: x[perm[:batch_total]], sampled)
+        sampled = jax.tree_util.tree_map(lambda x: x[perm[:batch_total]], sampled)
         # → (batch_total, ...)
 
         # 6. Reshape into (num_update_epochs * num_minibatches, batch_size, ...)
-        sampled = jax.tree.map(
+        sampled = jax.tree_util.tree_map(
             lambda x: x.reshape(
                 args.num_update_epochs * args.num_minibatches,
                 args.batch_size,
