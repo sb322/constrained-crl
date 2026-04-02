@@ -3,9 +3,6 @@ from brax import envs
 from envs.ant_maze import AntMaze
 from envs.humanoid_maze import HumanoidMaze
 
-# brax 0.10.1's register_environment does not forward kwargs to the constructor.
-# Use functools.partial to bake maze_layout_name and maze_size_scaling in.
-
 def _ant(layout, scale=4.0):
     return functools.partial(AntMaze, maze_layout_name=layout, maze_size_scaling=scale)
 
