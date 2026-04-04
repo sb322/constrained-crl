@@ -43,13 +43,13 @@ from cost_utils import get_wall_centers, hybrid_cost
 @dataclass
 class Args:
     # ── Original CRL args ──────────────────────────────────────
-    env_id: str = "ant_big_maze"
-    eval_env_id: str = ""
+    env_id: str = "humanoid_big_maze"
+    eval_env_id: str = "humanoid_big_maze_eval"
     episode_length: int = 1000
     total_env_steps: int = 100_000_000
     num_epochs: int = 100
-    num_envs: int = 512
-    eval_envs: int = 128
+    num_envs: int = 256
+    eval_envs: int = 64
     eval_every: int = 1
     action_repeat: int = 1
     unroll_length: int = 62
@@ -72,9 +72,9 @@ class Args:
     critic_depth: int = 4
     actor_skip_connections: int = 0
     critic_skip_connections: int = 0
-    obs_dim: int = 29
-    goal_start_idx: int = 0
-    goal_end_idx: int = 2
+    obs_dim: int = 265          # HumanoidMaze: state_dim=268, last 3 = target xyz
+    goal_start_idx: int = 0    # root x,y,z live at obs[0:3] (pipeline_state.q[:3])
+    goal_end_idx: int = 3
     vis_length: int = 200
     save_buffer: int = 0
     track: bool = True
@@ -100,6 +100,10 @@ class Args:
     cost_critic_skip_connections: int = 0
     cost_critic_tau: float = 0.005   # Polyak
     cost_discount: float = 0.99      # γ_c for Bellman backup
+    # Depth ablation: depth > 0 overrides actor_depth, critic_depth,
+    # and cost_critic_depth simultaneously (for the sweep script).
+    # depth = 0 means use the three individual depth args above.
+    depth: int = 0
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -251,8 +255,17 @@ class TrainingState:
 
 def main(args: Args):
 
+    # ── Unified depth override ─────────────────────────────────
+    # When --depth D is passed (D > 0), override all three network depths.
+    # This is the primary knob for the depth ablation sweep.
+    if args.depth > 0:
+        args.actor_depth = args.depth
+        args.critic_depth = args.depth
+        args.cost_critic_depth = args.depth
+
     # ── Wandb ──────────────────────────────────────────────────
-    run_name = (f"{args.env_id}_ccrl_s{args.seed}_{int(time.time())}")
+    _eff_depth = args.depth if args.depth > 0 else args.actor_depth
+    run_name = f"{args.env_id}_ccrl_d{_eff_depth}_s{args.seed}_{int(time.time())}"
     if args.track:
         wandb.init(
             project=args.wandb_project,
@@ -407,12 +420,27 @@ def main(args: Args):
         )
         return next_env_state, transition
 
+    # Eval-time cost function — closed over wall geometry and cost params.
+    # Returns scalar cost for each xy position: (xy: [...,2]) -> [...].
+    if args.use_constraints:
+        def eval_cost_fn(xy: jnp.ndarray) -> jnp.ndarray:
+            cost, _, _ = hybrid_cost(
+                xy, wall_centers, half_wall_size,
+                args.alpha_cost, args.sigma_wall, args.contact_threshold,
+            )
+            return cost
+    else:
+        eval_cost_fn = None
+
     evaluator = CrlEvaluator(
         actor_step=actor_step,
         eval_env=eval_env,
         num_eval_envs=args.eval_envs,
         episode_length=args.episode_length,
         key=eval_key,
+        cost_fn=eval_cost_fn,
+        cost_budget_d=args.cost_budget_d,
+        obs_dim=args.obs_dim,
     )
 
     # ──────────────────────────────────────────────────────────
@@ -821,14 +849,18 @@ def main(args: Args):
         }
 
         if args.use_constraints:
+            _mean_cost = float(jnp.mean(epoch_metrics["mean_step_cost"]))
             log_dict.update({
-                "cost_critic_loss": float(jnp.mean(epoch_metrics["cost_critic_loss"])),
-                "mean_step_cost":   float(jnp.mean(epoch_metrics["mean_step_cost"])),
-                "mean_d_wall":      float(jnp.mean(epoch_metrics["mean_d_wall"])),
-                "collision_rate":   float(jnp.mean(epoch_metrics["collision_rate"])),
-                "mean_qc":          float(jnp.mean(epoch_metrics["mean_qc"])),
-                "mean_qc_pi":       float(jnp.mean(epoch_metrics["mean_qc_pi"])),
-                "lambda":           float(jnp.mean(epoch_metrics["lambda"])),
+                "cost_critic_loss":    float(jnp.mean(epoch_metrics["cost_critic_loss"])),
+                "mean_step_cost":      _mean_cost,
+                "mean_d_wall":         float(jnp.mean(epoch_metrics["mean_d_wall"])),
+                "collision_rate":      float(jnp.mean(epoch_metrics["collision_rate"])),
+                "mean_qc":             float(jnp.mean(epoch_metrics["mean_qc"])),
+                "mean_qc_pi":          float(jnp.mean(epoch_metrics["mean_qc_pi"])),
+                "lambda":              float(jnp.mean(epoch_metrics["lambda"])),
+                # Explicit CMDP violation: max(0, Ĵ_c - d).
+                # Positive values mean the constraint is currently violated.
+                "constraint_violation": max(0.0, _mean_cost - args.cost_budget_d),
             })
 
         print(
