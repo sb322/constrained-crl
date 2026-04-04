@@ -2,8 +2,8 @@
 #SBATCH --job-name=ccrl_depth
 #SBATCH --array=0-7                  # 8 jobs: 4 depths x 2 seeds
 #SBATCH --gres=gpu:a100_40g:1                 # 1 GPU per job
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=32G
+#SBATCH --cpus-per-task=1
+#SBATCH --mem=4G
 #SBATCH --time=24:00:00
 #SBATCH --partition=gpu
 #SBATCH --account=ag2682
