@@ -1,63 +1,78 @@
-#!/bin/bash
-#SBATCH --job-name=ccrl_depth
-#SBATCH --array=0-7%1                # 8 jobs: 4 depths x 2 seeds, 1 at a time
-#SBATCH --gres=gpu:a100_40g:1                 # 1 GPU per job
-#SBATCH --cpus-per-task=1
-#SBATCH --mem=4G
-#SBATCH --time=24:00:00
+#!/bin/bash -l
+#SBATCH --job-name=ccrl_depth_sweep
+#SBATCH --output=ccrl_sweep.%j.out
+#SBATCH --error=ccrl_sweep.%j.err
 #SBATCH --partition=gpu
 #SBATCH --account=ag2682
 #SBATCH --qos=high_ag2682
-#SBATCH --output=logs/ccrl_depth_%A_%a.out
-#SBATCH --error=logs/ccrl_depth_%A_%a.err
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=1
+#SBATCH --gres=gpu:a100_40g:1
+#SBATCH --mem=4G
+#SBATCH --time=192:00:00
 
-# ── Map array index → (depth, seed) ──────────────────────────────────────────
-# Array layout:  index = depth_idx * N_SEEDS + seed
-#   0 → depth=2 seed=0 |  1 → depth=2 seed=1
-#   2 → depth=4 seed=0 |  3 → depth=4 seed=1
-#   4 → depth=6 seed=0 |  5 → depth=6 seed=1
-#   6 → depth=8 seed=0 |  7 → depth=8 seed=1
+# Single job — all 8 (depth × seed) runs sequentially on one A100.
 
-DEPTHS=(2 4 6 8)
-N_SEEDS=2
-
-DEPTH_IDX=$(( SLURM_ARRAY_TASK_ID / N_SEEDS ))
-SEED=$(( SLURM_ARRAY_TASK_ID % N_SEEDS ))
-DEPTH=${DEPTHS[$DEPTH_IDX]}
-
-echo "======================================================"
-echo "  SLURM Array Job: $SLURM_ARRAY_JOB_ID[$SLURM_ARRAY_TASK_ID]"
-echo "  depth=$DEPTH  seed=$SEED"
-echo "  Node: $SLURMD_NODENAME  GPU: $CUDA_VISIBLE_DEVICES"
-echo "======================================================"
-
-# ── Environment setup ─────────────────────────────────────────────────────────
-# Adjust the conda env name / module loads to match your Wulver setup
 module purge
-module load cuda/12.1              # adjust to your CUDA version on Wulver
+module load slurm/wulver
+module load easybuild
+module load CUDA/12.8.0
 
-# Activate your conda/venv environment
-source ~/miniconda3/etc/profile.d/conda.sh
-conda activate ccrl                # change to your env name
+WORKDIR="/mmfs1/home/sb3222/projects/constrained-crl"
+VENV="$WORKDIR/.venv"
+PYTHON="$VENV/bin/python"
+CUDA_BIN="/apps/easybuild/el9_5.x86_64/software/CUDA/12.8.0/bin"
 
-# ── Project directory ─────────────────────────────────────────────────────────
-PROJECT_DIR=~/constrained-crl/constrained_crl   # adjust if different
-cd $PROJECT_DIR
+cd "$WORKDIR/constrained_crl" || exit 1
 
-# ── Log directory ─────────────────────────────────────────────────────────────
-mkdir -p logs
+export PATH="$VENV/bin:$CUDA_BIN:$PATH"
 
-# ── Run ───────────────────────────────────────────────────────────────────────
-python train.py \
-    --env_id            humanoid_big_maze \
-    --eval_env_id       humanoid_big_maze_eval \
-    --depth             $DEPTH \
-    --seed              $SEED \
-    --total_env_steps   100000000 \
-    --num_epochs        100 \
-    --use_constraints   True \
-    --cost_budget_d     0.1 \
-    --track             True \
-    --wandb_group       depth_ablation_v1
+PY_SITE=$("$PYTHON" - <<'PY'
+import site
+print(site.getsitepackages()[0])
+PY
+)
 
-echo "Job finished: depth=$DEPTH seed=$SEED"
+export LD_LIBRARY_PATH="$PY_SITE/nvidia/cudnn/lib:$PY_SITE/nvidia/cusolver/lib:$PY_SITE/nvidia/cublas/lib:$PY_SITE/nvidia/cuda_runtime/lib:$PY_SITE/nvidia/cuda_nvrtc/lib:$PY_SITE/nvidia/cufft/lib:$PY_SITE/nvidia/cuda_cupti/lib"
+export XLA_PYTHON_CLIENT_PREALLOCATE=false
+
+echo "===== PATH CHECK ====="
+echo "$PATH"
+echo "===== PYTHON CHECK ====="
+which python
+"$PYTHON" --version
+echo "===== JAX CHECK ====="
+"$PYTHON" - <<'PY'
+import jax
+print("devices =", jax.devices())
+print("default_backend =", jax.default_backend())
+PY
+
+# ── Sequential depth sweep ────────────────────────────────────────────────────
+DEPTHS=(2 4 6 8)
+SEEDS=(0 1)
+
+echo "===== START DEPTH SWEEP ====="
+for DEPTH in "${DEPTHS[@]}"; do
+    for SEED in "${SEEDS[@]}"; do
+        echo ""
+        echo "--- depth=$DEPTH  seed=$SEED  $(date) ---"
+
+        "$PYTHON" train.py \
+            --env_id            humanoid_big_maze \
+            --eval_env_id       humanoid_big_maze_eval \
+            --depth             $DEPTH \
+            --seed              $SEED \
+            --total_env_steps   100000000 \
+            --num_epochs        100 \
+            --use_constraints   True \
+            --cost_budget_d     0.1 \
+            --track             True \
+            --wandb_group       depth_ablation_v1
+
+        echo "--- DONE: depth=$DEPTH  seed=$SEED  $(date) ---"
+    done
+done
+
+echo "===== ALL RUNS COMPLETE ====="
