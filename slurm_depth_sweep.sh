@@ -6,6 +6,7 @@
 #SBATCH --mem=32G
 #SBATCH --time=24:00:00
 #SBATCH --partition=gpu
+#SBATCH --qos=normal
 #SBATCH --output=logs/ccrl_depth_%A_%a.out
 #SBATCH --error=logs/ccrl_depth_%A_%a.err
 
