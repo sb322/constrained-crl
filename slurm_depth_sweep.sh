@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=ccrl_depth
-#SBATCH --array=0-7                  # 8 jobs: 4 depths x 2 seeds
+#SBATCH --array=0-7%1                # 8 jobs: 4 depths x 2 seeds, 1 at a time
 #SBATCH --gres=gpu:a100_40g:1                 # 1 GPU per job
 #SBATCH --cpus-per-task=1
 #SBATCH --mem=4G
