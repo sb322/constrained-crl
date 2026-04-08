@@ -668,6 +668,11 @@ def main(args: Args):
         action = nn.tanh(x_ts)
 
         next_env_state = env.step(env_state, action)
+        _info = next_env_state.info
+        _seed = (_info["state_extras"]["seed"]
+                 if "state_extras" in _info else jnp.zeros(args.num_envs))
+        _trunc = (_info["state_extras"]["truncation"]
+                  if "state_extras" in _info else jnp.zeros(args.num_envs))
 
         transition = Transition(
             observation=obs,
@@ -677,8 +682,8 @@ def main(args: Args):
             extras={
                 "state_extras": {
                     # seed tracks episode ID; incremented by brax's EpisodeWrapper
-                    "seed":       next_env_state.info["state_extras"]["seed"],
-                    "truncation": next_env_state.info["state_extras"]["truncation"],
+                    "seed":       _seed,
+                    "truncation": _trunc,
                 },
                 "state": obs[:, :args.obs_dim],  # raw state for cost critic next-step
             },
@@ -785,6 +790,11 @@ def main(args: Args):
         key, ak = jax.random.split(key)
         action = jax.random.uniform(ak, (args.num_envs, action_size), minval=-1.0, maxval=1.0)
         next_env_state = env.step(env_state, action)
+        _info = next_env_state.info
+        _seed = (_info["state_extras"]["seed"]
+                 if "state_extras" in _info else jnp.zeros(args.num_envs))
+        _trunc = (_info["state_extras"]["truncation"]
+                  if "state_extras" in _info else jnp.zeros(args.num_envs))
         t = Transition(
             observation=env_state.obs,
             action=action,
@@ -792,8 +802,8 @@ def main(args: Args):
             discount=1.0 - next_env_state.done,
             extras={
                 "state_extras": {
-                    "seed":       next_env_state.info["state_extras"]["seed"],
-                    "truncation": next_env_state.info["state_extras"]["truncation"],
+                    "seed":       _seed,
+                    "truncation": _trunc,
                 },
                 "state": env_state.obs[:, :args.obs_dim],
             },
