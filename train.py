@@ -295,6 +295,18 @@ def main(args: Args):
     goal_dim = args.goal_end_idx - args.goal_start_idx
     obs_size = args.obs_dim + goal_dim
 
+    # Auto-detect actual observation size from the environment.
+    # args.obs_dim may differ from the brax version installed on this machine.
+    # We probe with a tiny reset to get the ground-truth shape, then correct
+    # args.obs_dim and obs_size so networks, buffer, and transitions all agree.
+    _probe_keys = jax.random.split(jax.random.PRNGKey(0), 2)
+    _probe_obs_size = int(env.reset(_probe_keys).obs.shape[-1])
+    if _probe_obs_size != obs_size:
+        print(f"[obs_dim auto-correct] args.obs_dim={args.obs_dim} → "
+              f"{_probe_obs_size - goal_dim}  (env obs={_probe_obs_size}, goal={goal_dim})")
+        args.obs_dim = _probe_obs_size - goal_dim
+        obs_size = _probe_obs_size
+
     # ── Wall geometry (for cost computation) ───────────────────
     if args.use_constraints:
         wall_centers, half_wall_size = get_wall_centers(args.env_id)
