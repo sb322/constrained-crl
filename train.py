@@ -808,7 +808,8 @@ def main(args: Args):
                 "state": env_state.obs[:, :args.obs_dim],
             },
         )
-        buffer_state = replay_buffer.insert_internal(buffer_state, t[None])  # add unroll dim=1
+        t1 = jax.tree_util.tree_map(lambda x: x[None], t)  # add unroll dim=1
+        buffer_state = replay_buffer.insert_internal(buffer_state, t1)
         return (next_env_state, buffer_state, key), ()
 
     (env_state, buffer_state, _), _ = jax.lax.scan(
