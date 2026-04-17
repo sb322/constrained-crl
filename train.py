@@ -301,7 +301,15 @@ def main(args: Args):
         action_repeat=args.action_repeat,
     )
     eval_env_id = args.eval_env_id if args.eval_env_id else args.env_id
-    eval_env = envs.get_environment(eval_env_id)
+    # Wrap eval env with brax's training wrappers so the evaluator can pass a
+    # batched PRNG key of shape (num_eval_envs,) to reset(). Without VmapWrapper
+    # the underlying ant_maze.reset sees shape (N,) and jax.random.split raises
+    # "split accepts a single key, but was given a key array of shape (N,)".
+    eval_env = envs.training.wrap(
+        envs.get_environment(eval_env_id),
+        episode_length=args.episode_length,
+        action_repeat=args.action_repeat,
+    )
 
     action_size = raw_env.action_size
     goal_dim = args.goal_end_idx - args.goal_start_idx
