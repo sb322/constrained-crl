@@ -29,14 +29,18 @@ module load slurm/wulver
 module load easybuild
 module load CUDA/12.8.0
 
-WORKDIR="/mmfs1/home/sb3222/projects/constrained-crl"
-VENV="$WORKDIR/.venv"
-PYTHON="$VENV/bin/python"
-
-cd "$WORKDIR/constrained_crl" || exit 1
+# Run from the directory you submitted sbatch from — no hard-coded path.
+cd "${SLURM_SUBMIT_DIR:-$PWD}" || { echo "cd to SLURM_SUBMIT_DIR failed"; exit 1; }
 mkdir -p logs checkpoints
 
+# Locate the venv: .venv in this dir, else one level up.
+if   [ -x "./.venv/bin/python" ];        then VENV="$(pwd)/.venv"
+elif [ -x "../.venv/bin/python" ];       then VENV="$(cd .. && pwd)/.venv"
+else echo "FATAL: no .venv/bin/python found in $(pwd) or $(dirname $(pwd))"; exit 1
+fi
+PYTHON="$VENV/bin/python"
 export PATH="$VENV/bin:$PATH"
+echo "Using PYTHON=$PYTHON  (cwd=$(pwd))"
 
 # ── LD_LIBRARY_PATH: pip-installed nvidia libs first, then system CUDA ──
 PY_SITE=$("$PYTHON" - <<'PY'
