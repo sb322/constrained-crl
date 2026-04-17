@@ -195,6 +195,11 @@ class TrajectoryUniformSamplingQueue():
         goal = future_state[:, goal_start_idx : goal_end_idx]
         future_state = future_state[:, : obs_dim]
         state = transition.observation[:-1, : obs_dim]
+        # Actual next state s_{t+1} for the cost critic Bellman target.
+        # transition.observation has shape [seq_len, obs_size]; s_{t+1} for
+        # the first seq_len-1 transitions is observation[1:].  Slice to obs_dim
+        # (strip goal concat if present) to match `state` shape.
+        next_state = transition.observation[1:, : obs_dim]
 
         new_obs = jnp.concatenate([state, goal], axis=1)
 
@@ -205,6 +210,7 @@ class TrajectoryUniformSamplingQueue():
                 "seed": jnp.squeeze(transition.extras["state_extras"]["seed"][:-1]),
             },
             "state": state,
+            "next_state": next_state,
             "future_state": future_state,
             "future_action": future_action,
         }

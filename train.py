@@ -424,7 +424,12 @@ def main(args: Args):
                 "seed": jnp.zeros(()),
                 "truncation": jnp.zeros(()),
             },
-            "state": jnp.zeros(args.obs_dim),
+            "state":      jnp.zeros(args.obs_dim),   # s_t
+            "next_state": jnp.zeros(args.obs_dim),   # s_{t+1} — required by
+                                                      # cost_critic_loss_fn.
+                                                      # Must match the shape that
+                                                      # collect_step / prefill_one
+                                                      # actually insert.
         },
     )
 
@@ -579,7 +584,11 @@ def main(args: Args):
         action       = transitions.action
         future_state = transitions.extras["future_state"]
         state        = obs[:, :args.obs_dim]
-        next_state   = transitions.extras["state"]   # raw s' stored at collection
+        # s_{t+1} for the Bellman target.  transitions.extras["state"] is s_t,
+        # NOT s_{t+1} — using it collapsed Q_c into a stationary self-reference
+        # and violated the contractive backup.  The collector / flatten_crl_fn
+        # now provide explicit "next_state" = s_{t+1}.
+        next_state   = transitions.extras["next_state"]
         goal         = future_state[:, args.goal_start_idx:args.goal_end_idx]
 
         # Smooth sigmoid cost on current state
@@ -798,10 +807,12 @@ def main(args: Args):
 
         next_env_state = env.step(env_state, action)
         _info = next_env_state.info
-        _seed = (_info["state_extras"]["seed"]
-                 if "state_extras" in _info else jnp.zeros(args.num_envs))
-        _trunc = (_info["state_extras"]["truncation"]
-                  if "state_extras" in _info else jnp.zeros(args.num_envs))
+        # Our maze envs store `seed` directly in info; brax's EpisodeWrapper
+        # adds `truncation`.  There is no "state_extras" sub-dict — reading it
+        # silently fell back to zeros and broke goal relabeling (all trajectories
+        # looked like one episode).  Access the keys directly.
+        _seed  = _info["seed"]       if "seed"       in _info else jnp.zeros(args.num_envs)
+        _trunc = _info["truncation"] if "truncation" in _info else jnp.zeros(args.num_envs)
 
         transition = Transition(
             observation=obs,
@@ -814,7 +825,10 @@ def main(args: Args):
                     "seed":       _seed,
                     "truncation": _trunc,
                 },
-                "state": obs[:, :args.obs_dim],  # raw state for cost critic next-step
+                "state":      obs[:, :args.obs_dim],                  # s_t
+                "next_state": next_env_state.obs[:, :args.obs_dim],   # s_{t+1} — needed
+                                                                      # by cost_critic_loss_fn
+                                                                      # Bellman backup
             },
         )
         return (next_env_state, actor_params, key), transition
@@ -920,10 +934,8 @@ def main(args: Args):
         action = jax.random.uniform(ak, (args.num_envs, action_size), minval=-1.0, maxval=1.0)
         next_env_state = env.step(env_state, action)
         _info = next_env_state.info
-        _seed = (_info["state_extras"]["seed"]
-                 if "state_extras" in _info else jnp.zeros(args.num_envs))
-        _trunc = (_info["state_extras"]["truncation"]
-                  if "state_extras" in _info else jnp.zeros(args.num_envs))
+        _seed  = _info["seed"]       if "seed"       in _info else jnp.zeros(args.num_envs)
+        _trunc = _info["truncation"] if "truncation" in _info else jnp.zeros(args.num_envs)
         t = Transition(
             observation=env_state.obs,
             action=action,
@@ -934,7 +946,8 @@ def main(args: Args):
                     "seed":       _seed,
                     "truncation": _trunc,
                 },
-                "state": env_state.obs[:, :args.obs_dim],
+                "state":      env_state.obs[:, :args.obs_dim],       # s_t
+                "next_state": next_env_state.obs[:, :args.obs_dim],  # s_{t+1}
             },
         )
         t1 = jax.tree_util.tree_map(lambda x: x[None], t)  # add unroll dim=1
@@ -1052,5 +1065,8 @@ def main(args: Args):
 
 
 if __name__ == "__main__":
-    args = tyro.cli(Args)
+    # FlagConversionOff: let booleans accept `--use_constraints True/False`
+    # instead of tyro's default `--use-constraints`/`--no-use-constraints`.
+    # This matches the syntax used in every SLURM script in this repo.
+    args = tyro.cli(Args, config=(tyro.conf.FlagConversionOff,))
     main(args)
