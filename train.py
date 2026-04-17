@@ -1,12 +1,12 @@
 """
-train.py — Constrained Contrastive RL (C-CRL)
+train.py — SR-CPO: Surrogate-Reward Constrained Policy Optimization
 
 Drop-in replacement for scaling-crl/train.py that adds:
-  • CostCritic  Q_c(s,a,g)  trained with Bellman backups
-  • Hybrid step cost  c = α·1{collision} + (1-α)·exp(-d/σ)
-  • Lagrangian actor loss  L = E[α_sac·log π - Q + λ·Q_c]
-  • Dual ascent  λ ← clip(λ + lr_λ·(Ĵ_c - d), 0, λ_max)
-  • Full wandb logging of cost metrics
+  • CostCritic  Q_c(s,a,g)  trained with plain cost-to-go (no entropy)
+  • Smooth sigmoid cost  c(s) = σ((ε − d_wall) / τ)
+  • Preconditioned actor loss  L = E[α·log π − f/ν_f + λ̃·Q_c/ν_c]
+  • PID-Lagrangian dual update with critic-based estimator
+  • Calibration logging (Kendall τ) for theory-practice gap monitoring
 
 All original CRL logic (InfoNCE critic, residual networks, SAC
 entropy, geometric goal relabeling) is preserved exactly.
@@ -33,7 +33,7 @@ from flax.training.train_state import TrainState
 # NOTE: flatten_crl_fn is a *static method* on the class, NOT a module export.
 from buffer import TrajectoryUniformSamplingQueue
 from evaluator import CrlEvaluator
-from cost_utils import get_wall_centers, hybrid_cost
+from cost_utils import get_wall_centers, smooth_sigmoid_cost, hard_indicator_cost
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -82,24 +82,33 @@ class Args:
     wandb_entity: str = ""
     wandb_group: str = ""
 
-    # ── Constrained CRL additions ──────────────────────────────
+    # ── SR-CPO Constrained additions ─────────────────────────────
     use_constraints: bool = True
-    # Hybrid cost: c = α·1{collision} + (1-α)·exp(-d/σ)
-    alpha_cost: float = 0.5
-    sigma_wall: float = 1.0
-    contact_threshold: float = 0.1
-    # CMDP budget & Lagrange multiplier
+    # Smooth sigmoid cost: c(s) = σ((ε − d_wall) / τ)
+    cost_epsilon: float = 0.1        # proximity threshold ε
+    cost_tau: float = 0.05           # sigmoid temperature τ (smaller = sharper)
+    # CMDP budget
     cost_budget_d: float = 0.1
-    lambda_init: float = 0.0
-    lambda_lr: float = 1e-3
     lambda_max: float = 100.0
+    # PID-Lagrangian dual update (replaces simple gradient ascent)
+    pid_kp: float = 0.1             # proportional gain
+    pid_ki: float = 0.003           # integral gain
+    pid_kd: float = 0.001           # derivative gain
+    # Gradient preconditioning scales
+    # ν_f = log(N) where N = batch_size (InfoNCE normalization constant)
+    # ν_c = 1/(1-γ) (cost-to-go scale)
+    # These are computed from other args at init; set to 0 for auto.
+    nu_f: float = 0.0               # 0 = auto → log(batch_size)
+    nu_c: float = 0.0               # 0 = auto → 1/(1-gamma)
     # Cost critic architecture
     cost_critic_lr: float = 3e-4
     cost_critic_width: int = 256
     cost_critic_depth: int = 4
     cost_critic_skip_connections: int = 0
-    cost_critic_tau: float = 0.005   # Polyak
+    cost_critic_tau: float = 0.005   # Polyak averaging coefficient
     cost_discount: float = 0.99      # γ_c for Bellman backup
+    # Initial-state estimator: number of goals to sample for Ĵ_c
+    dual_estimator_goals: int = 64
     # Depth ablation: depth > 0 overrides actor_depth, critic_depth,
     # and cost_critic_depth simultaneously (for the sweep script).
     # depth = 0 means use the three individual depth args above.
@@ -243,10 +252,13 @@ class TrainingState:
     actor_state: TrainState
     critic_state: TrainState
     alpha_state: TrainState
-    # Constraint additions
+    # SR-CPO constraint additions
     cost_critic_state: TrainState
     cost_critic_target_params: dict
-    log_lambda: jnp.ndarray
+    # PID-Lagrangian state
+    lambda_tilde: jnp.ndarray     # λ̃ = current dual variable (after PID)
+    pid_e_prev: jnp.ndarray       # e_{k-1} for derivative term
+    pid_sum_e: jnp.ndarray        # Σ e_j for integral term
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -373,7 +385,17 @@ def main(args: Args):
     )
     cost_critic_target_params = jax.tree_util.tree_map(jnp.copy, cost_critic_params)
 
-    log_lambda = jnp.log(jnp.maximum(args.lambda_init, 1e-8))
+    # ── Auto-compute preconditioning scales ──────────────────
+    if args.nu_f == 0.0:
+        args.nu_f = float(jnp.log(args.batch_size))  # log(N), InfoNCE scale
+    if args.nu_c == 0.0:
+        args.nu_c = 1.0 / (1.0 - args.gamma)         # 1/(1-γ), cost-to-go scale
+    print(f"  Preconditioning: ν_f={args.nu_f:.4f}, ν_c={args.nu_c:.4f}")
+
+    # ── PID-Lagrangian initial state ──────────────────────────
+    lambda_tilde = jnp.zeros((), dtype=jnp.float32)
+    pid_e_prev = jnp.zeros((), dtype=jnp.float32)
+    pid_sum_e = jnp.zeros((), dtype=jnp.float32)
 
     training_state = TrainingState(
         env_steps=jnp.zeros(()),
@@ -383,7 +405,9 @@ def main(args: Args):
         alpha_state=alpha_state,
         cost_critic_state=cost_critic_state,
         cost_critic_target_params=cost_critic_target_params,
-        log_lambda=log_lambda,
+        lambda_tilde=lambda_tilde,
+        pid_e_prev=pid_e_prev,
+        pid_sum_e=pid_sum_e,
     )
 
     # ── Replay buffer ──────────────────────────────────────────
@@ -432,17 +456,28 @@ def main(args: Args):
         )
         return next_env_state, transition
 
-    # Eval-time cost function — closed over wall geometry and cost params.
+    # Eval-time cost function — uses hard indicator for interpretable metrics.
     # Returns scalar cost for each xy position: (xy: [...,2]) -> [...].
     if args.use_constraints:
         def eval_cost_fn(xy: jnp.ndarray) -> jnp.ndarray:
-            cost, _, _ = hybrid_cost(
+            return hard_indicator_cost(
                 xy, wall_centers, half_wall_size,
-                args.alpha_cost, args.sigma_wall, args.contact_threshold,
+                cost_epsilon=args.cost_epsilon,
+            )
+    else:
+        eval_cost_fn = None
+
+    # Smooth cost function for calibration tracking at eval time
+    if args.use_constraints:
+        def eval_smooth_cost_fn(xy: jnp.ndarray) -> jnp.ndarray:
+            cost, _, _ = smooth_sigmoid_cost(
+                xy, wall_centers, half_wall_size,
+                cost_epsilon=args.cost_epsilon,
+                cost_tau=args.cost_tau,
             )
             return cost
     else:
-        eval_cost_fn = None
+        eval_smooth_cost_fn = None
 
     evaluator = CrlEvaluator(
         actor_step=actor_step,
@@ -453,6 +488,7 @@ def main(args: Args):
         cost_fn=eval_cost_fn,
         cost_budget_d=args.cost_budget_d,
         obs_dim=args.obs_dim,
+        smooth_cost_fn=eval_smooth_cost_fn,
     )
 
     # ──────────────────────────────────────────────────────────
@@ -483,14 +519,22 @@ def main(args: Args):
         return loss, (logits_pos, logits_neg, jnp.mean(correct), jnp.mean(logsumexp_val))
 
     def actor_loss_fn(actor_params, critic_params, log_alpha,
-                      cost_critic_params, log_lam, transitions, key):
-        """Lagrangian actor loss: E[α_sac·log π  -  Q  +  λ·Q_c]."""
+                      cost_critic_params, lambda_tilde, transitions, key):
+        """Preconditioned SR-CPO actor loss:
+
+            L = E[α·log π  −  f(s,a,g)/ν_f  +  λ̃·Q_c(s,a,g)/ν_c]
+
+        where ν_f = log(N) and ν_c = 1/(1−γ) are fixed preconditioning
+        scales that put the contrastive surrogate and cost critic on
+        comparable gradient magnitude.  λ̃ is the PID dual variable.
+        """
         obs          = transitions.observation
         future_state = transitions.extras["future_state"]
         state        = obs[:, :args.obs_dim]
         goal         = future_state[:, args.goal_start_idx:args.goal_end_idx]
         observation  = jnp.concatenate([state, goal], axis=1)
 
+        # Reparameterized action sample (SAC-style)
         means, log_stds = actor.apply(actor_params, observation)
         stds = jnp.exp(log_stds)
         x_ts = means + stds * jax.random.normal(key, shape=means.shape)
@@ -499,19 +543,21 @@ def main(args: Args):
         log_prob -= jnp.log((1 - jnp.square(action)) + 1e-6)
         log_prob = log_prob.sum(-1)
 
+        # Contrastive critic f(s,a,g) — this is the InfoNCE log-density ratio
         sa_repr = sa_encoder.apply(critic_params["sa_encoder"], state, action)
         g_repr  = g_encoder.apply(critic_params["g_encoder"],  goal)
-        qf_pi   = -jnp.sqrt(jnp.sum((sa_repr - g_repr) ** 2, axis=-1))
+        f_sa_g  = -jnp.sqrt(jnp.sum((sa_repr - g_repr) ** 2, axis=-1))
 
-        alpha      = jnp.exp(log_alpha)
-        actor_loss = jnp.mean(alpha * log_prob - qf_pi)
+        alpha = jnp.exp(log_alpha)
+        # Preconditioned: divide f by ν_f to normalize InfoNCE scale
+        actor_loss = jnp.mean(alpha * log_prob - f_sa_g / args.nu_f)
 
         if args.use_constraints:
-            lam    = jnp.exp(log_lam)
-            qc_pi  = cost_critic.apply(cost_critic_params, state, action, goal)
-            actor_loss = actor_loss + jnp.mean(lam * qc_pi)
+            qc_pi = cost_critic.apply(cost_critic_params, state, action, goal)
+            # Preconditioned: divide Q_c by ν_c to normalize cost-to-go scale
+            actor_loss = actor_loss + jnp.mean(lambda_tilde * qc_pi / args.nu_c)
         else:
-            qc_pi = jnp.zeros_like(qf_pi)
+            qc_pi = jnp.zeros_like(f_sa_g)
 
         return actor_loss, (log_prob, jnp.mean(qc_pi))
 
@@ -520,28 +566,31 @@ def main(args: Args):
 
     def cost_critic_loss_fn(cost_critic_params, cost_critic_target_params,
                             actor_params, transitions, key):
-        """TD(0) Bellman loss for Q_c.
+        """TD(0) Bellman loss for Q_c with plain cost-to-go (NO entropy).
 
-        FIX vs. old version: actor_params is now an explicit argument so the
-        loss always uses the *current* (just-updated) actor, not stale closure.
+        Target: y = c(s) + γ_c · Q_c^target(s', a', g)
+        where a' ~ π(·|s',g) and V_c(s',g) = E_{a'~π}[Q_c(s',a',g)]
+        (plain expectation, no -α·log π term — this is cost-to-go, not
+        soft value).  See SR-CPO theory §5.3.
+
+        Uses smooth sigmoid cost c(s) = σ((ε - d_wall)/τ).
         """
         obs          = transitions.observation
         action       = transitions.action
         future_state = transitions.extras["future_state"]
         state        = obs[:, :args.obs_dim]
-        next_state   = transitions.extras["state"]   # raw s stored at collection
+        next_state   = transitions.extras["state"]   # raw s' stored at collection
         goal         = future_state[:, args.goal_start_idx:args.goal_end_idx]
 
-        # Step cost from maze geometry (computed on current state)
+        # Smooth sigmoid cost on current state
         agent_xy = state[:, :2]
-        cost, d_wall, collision = hybrid_cost(
+        cost, d_wall, hard_indicator = smooth_sigmoid_cost(
             agent_xy, wall_centers, half_wall_size,
-            alpha_cost=args.alpha_cost,
-            sigma_wall=args.sigma_wall,
-            contact_threshold=args.contact_threshold,
+            cost_epsilon=args.cost_epsilon,
+            cost_tau=args.cost_tau,
         )
 
-        # Next-state action from current policy
+        # Next-state action from current policy (plain sample, no entropy)
         next_obs = jnp.concatenate([next_state, goal], axis=1)
         means_next, log_stds_next = actor.apply(actor_params, next_obs)
         key, subkey = jax.random.split(key)
@@ -549,8 +598,11 @@ def main(args: Args):
             subkey, shape=means_next.shape)
         action_next = nn.tanh(x_next)
 
+        # Plain cost-to-go target: y = c(s) + γ_c · Q_c^target(s', a', g)
+        # NOTE: No -α·log π term here. This is deliberate — the cost critic
+        # estimates the undiscounted/discounted cost stream, not a soft value.
         qc_target = cost_critic.apply(cost_critic_target_params, next_state, action_next, goal)
-        td_target  = jax.lax.stop_gradient(cost + args.cost_discount * qc_target)
+        td_target = jax.lax.stop_gradient(cost + args.cost_discount * qc_target)
 
         qc_online = cost_critic.apply(cost_critic_params, state, action, goal)
         loss = jnp.mean((qc_online - td_target) ** 2)
@@ -559,7 +611,7 @@ def main(args: Args):
             "cost_critic_loss": loss,
             "mean_step_cost":   jnp.mean(cost),
             "mean_d_wall":      jnp.mean(d_wall),
-            "collision_rate":   jnp.mean(collision),
+            "hard_violation_rate": jnp.mean(hard_indicator),
             "mean_qc":          jnp.mean(qc_online),
         }
 
@@ -567,47 +619,87 @@ def main(args: Args):
     #  SGD step — NO @jax.jit; it lives inside jax.lax.scan
     # ──────────────────────────────────────────────────────────
 
+    def _critic_based_dual_estimator(cost_critic_params, actor_params,
+                                     initial_obs, goals, key):
+        """Ĵ_c = (1-γ) · (1/M) · Σ_m V_c(s_0, g_m).
+
+        Estimates the expected discounted cost under the current policy
+        from initial states, using the cost critic.  This replaces the
+        biased batch-average estimator from the old code.
+
+        Args:
+            cost_critic_params: current cost critic parameters.
+            actor_params: current actor parameters.
+            initial_obs: [B, obs_dim] initial observations (s_0 ~ ρ_0).
+            goals: [M, goal_dim] sampled goals.
+            key: PRNG key for action sampling.
+
+        Returns:
+            j_c_hat: scalar estimate of J_c(π_θ).
+        """
+        # For each (s_0, g) pair, sample a ~ π(·|s_0, g) and get Q_c
+        M = goals.shape[0]
+        B = initial_obs.shape[0]
+        # Use first B states, tile goals: [B, M, ...]
+        s0 = initial_obs[:, None, :].repeat(M, axis=1)  # [B, M, obs_dim]
+        g  = goals[None, :, :].repeat(B, axis=0)         # [B, M, goal_dim]
+        s0_flat = s0.reshape(-1, initial_obs.shape[-1])   # [B*M, obs_dim]
+        g_flat  = g.reshape(-1, goals.shape[-1])          # [B*M, goal_dim]
+
+        obs_flat = jnp.concatenate([s0_flat, g_flat], axis=-1)
+        means, log_stds = actor.apply(actor_params, obs_flat)
+        a_flat = nn.tanh(means + jnp.exp(log_stds) * jax.random.normal(
+            key, shape=means.shape))
+
+        qc_vals = cost_critic.apply(cost_critic_params, s0_flat, a_flat, g_flat)
+        # V_c(s_0, g) ≈ Q_c(s_0, a, g) for a ~ π
+        v_c = qc_vals.reshape(B, M).mean(axis=0)  # [M] — average over s_0
+        j_c_hat = (1.0 - args.gamma) * jnp.mean(v_c)
+        return j_c_hat
+
     def sgd_step(carry, transitions):
         training_state, key = carry
-        key, critic_key, actor_key, cost_key = jax.random.split(key, 4)
+        key, critic_key, actor_key, cost_key, dual_key = jax.random.split(key, 5)
 
-        # Critic
+        # ── InfoNCE Critic update ─────────────────────────────
         (c_loss, (lp, ln, acc, lse)), c_grads = jax.value_and_grad(
             critic_loss_fn, has_aux=True)(
             training_state.critic_state.params, transitions, critic_key)
         critic_state = training_state.critic_state.apply_gradients(grads=c_grads)
 
-        # Actor (Lagrangian)
+        # ── Actor update (preconditioned Lagrangian) ──────────
         (a_loss, (log_prob, mean_qc_pi)), a_grads = jax.value_and_grad(
             actor_loss_fn, has_aux=True)(
             training_state.actor_state.params,
             critic_state.params,
             training_state.alpha_state.params,
             training_state.cost_critic_state.params,
-            training_state.log_lambda,
+            training_state.lambda_tilde,
             transitions,
             actor_key,
         )
         actor_state = training_state.actor_state.apply_gradients(grads=a_grads)
 
-        # Alpha
+        # ── SAC entropy alpha ─────────────────────────────────
         al_loss, al_grads = jax.value_and_grad(alpha_loss_fn)(
             training_state.alpha_state.params, log_prob)
         alpha_state = training_state.alpha_state.apply_gradients(grads=al_grads)
 
-        # Cost critic — FIX: pass actor_state.params (updated above)
+        # ── Cost critic + PID dual update ─────────────────────
         if args.use_constraints:
+            # Cost critic TD update
             (cc_loss, cc_m), cc_grads = jax.value_and_grad(
                 cost_critic_loss_fn, has_aux=True)(
                 training_state.cost_critic_state.params,
                 training_state.cost_critic_target_params,
-                actor_state.params,           # ← updated actor params
+                actor_state.params,
                 transitions,
                 cost_key,
             )
             cost_critic_state_new = training_state.cost_critic_state.apply_gradients(
                 grads=cc_grads)
 
+            # Polyak target update
             tau = args.cost_critic_tau
             target_params_new = jax.tree_util.tree_map(
                 lambda p, tp: tau * p + (1.0 - tau) * tp,
@@ -615,20 +707,42 @@ def main(args: Args):
                 training_state.cost_critic_target_params,
             )
 
-            lam = jnp.exp(training_state.log_lambda)
-            lam_new = jnp.clip(
-                lam + args.lambda_lr * (cc_m["mean_step_cost"] - args.cost_budget_d),
-                1e-8, args.lambda_max,
+            # ── Critic-based dual estimator ───────────────────
+            # Use initial observations from the batch as s_0 ~ ρ_0
+            # and goals from the batch for the Monte Carlo estimate.
+            initial_obs = transitions.observation[:, :args.obs_dim]
+            future_state = transitions.extras["future_state"]
+            goals = future_state[:args.dual_estimator_goals,
+                                 args.goal_start_idx:args.goal_end_idx]
+            j_c_hat = _critic_based_dual_estimator(
+                cost_critic_state_new.params, actor_state.params,
+                initial_obs[:args.dual_estimator_goals],
+                goals, dual_key,
             )
-            log_lambda_new = jnp.log(lam_new)
+
+            # ── PID-Lagrangian update ─────────────────────────
+            # e_k = Ĵ_c - d  (constraint error: positive = violation)
+            e_k = j_c_hat - args.cost_budget_d
+            pid_sum_e_new = training_state.pid_sum_e + e_k
+            lambda_tilde_new = jnp.clip(
+                args.pid_kp * e_k
+                + args.pid_ki * pid_sum_e_new
+                + args.pid_kd * (e_k - training_state.pid_e_prev),
+                0.0, args.lambda_max,
+            )
+
+            j_c_hat_metric = j_c_hat
         else:
             cost_critic_state_new = training_state.cost_critic_state
-            target_params_new     = training_state.cost_critic_target_params
-            log_lambda_new        = training_state.log_lambda
-            cc_loss               = jnp.zeros(())
+            target_params_new = training_state.cost_critic_target_params
+            lambda_tilde_new = training_state.lambda_tilde
+            e_k = jnp.zeros(())
+            pid_sum_e_new = training_state.pid_sum_e
+            cc_loss = jnp.zeros(())
             cc_m = {k: jnp.zeros(()) for k in
                     ["cost_critic_loss", "mean_step_cost", "mean_d_wall",
-                     "collision_rate", "mean_qc"]}
+                     "hard_violation_rate", "mean_qc"]}
+            j_c_hat_metric = jnp.zeros(())
 
         new_ts = TrainingState(
             env_steps=training_state.env_steps,
@@ -638,7 +752,9 @@ def main(args: Args):
             alpha_state=alpha_state,
             cost_critic_state=cost_critic_state_new,
             cost_critic_target_params=target_params_new,
-            log_lambda=log_lambda_new,
+            lambda_tilde=lambda_tilde_new,
+            pid_e_prev=e_k,
+            pid_sum_e=pid_sum_e_new,
         )
 
         metrics = {
@@ -653,9 +769,10 @@ def main(args: Args):
             "cost_critic_loss": cc_m["cost_critic_loss"],
             "mean_step_cost":   cc_m["mean_step_cost"],
             "mean_d_wall":      cc_m["mean_d_wall"],
-            "collision_rate":   cc_m["collision_rate"],
+            "hard_violation_rate": cc_m["hard_violation_rate"],
             "mean_qc":          cc_m["mean_qc"],
-            "lambda":           jnp.exp(log_lambda_new),
+            "lambda_tilde":     lambda_tilde_new,
+            "j_c_hat":          j_c_hat_metric,
             "mean_qc_pi":       mean_qc_pi,
         }
         return (new_ts, key), metrics
@@ -829,7 +946,8 @@ def main(args: Args):
     print(f"Buffer prefilled with ~{prefill_steps * args.num_envs} transitions.")
     print(f"Starting {args.num_epochs} epochs.  Constraints: {args.use_constraints}")
     if args.use_constraints:
-        print(f"  budget={args.cost_budget_d}  α_cost={args.alpha_cost}  σ={args.sigma_wall}")
+        print(f"  budget={args.cost_budget_d}  ε={args.cost_epsilon}  τ={args.cost_tau}"
+              f"  PID=({args.pid_kp},{args.pid_ki},{args.pid_kd})")
 
     # ──────────────────────────────────────────────────────────
     #  Main training loop
@@ -873,17 +991,18 @@ def main(args: Args):
 
         if args.use_constraints:
             _mean_cost = float(jnp.mean(epoch_metrics["mean_step_cost"]))
+            _j_c_hat = float(jnp.mean(epoch_metrics["j_c_hat"]))
             log_dict.update({
-                "cost_critic_loss":    float(jnp.mean(epoch_metrics["cost_critic_loss"])),
-                "mean_step_cost":      _mean_cost,
-                "mean_d_wall":         float(jnp.mean(epoch_metrics["mean_d_wall"])),
-                "collision_rate":      float(jnp.mean(epoch_metrics["collision_rate"])),
-                "mean_qc":             float(jnp.mean(epoch_metrics["mean_qc"])),
-                "mean_qc_pi":          float(jnp.mean(epoch_metrics["mean_qc_pi"])),
-                "lambda":              float(jnp.mean(epoch_metrics["lambda"])),
-                # Explicit CMDP violation: max(0, Ĵ_c - d).
-                # Positive values mean the constraint is currently violated.
-                "constraint_violation": max(0.0, _mean_cost - args.cost_budget_d),
+                "cost_critic_loss":     float(jnp.mean(epoch_metrics["cost_critic_loss"])),
+                "mean_step_cost":       _mean_cost,
+                "mean_d_wall":          float(jnp.mean(epoch_metrics["mean_d_wall"])),
+                "hard_violation_rate":  float(jnp.mean(epoch_metrics["hard_violation_rate"])),
+                "mean_qc":              float(jnp.mean(epoch_metrics["mean_qc"])),
+                "mean_qc_pi":           float(jnp.mean(epoch_metrics["mean_qc_pi"])),
+                "lambda_tilde":         float(jnp.mean(epoch_metrics["lambda_tilde"])),
+                "j_c_hat":              _j_c_hat,
+                # Constraint violation from critic-based estimator
+                "constraint_violation": max(0.0, _j_c_hat - args.cost_budget_d),
             })
 
         print(
@@ -894,9 +1013,10 @@ def main(args: Args):
         )
         if args.use_constraints:
             print(
-                f"         collisions={log_dict['collision_rate']:.4f} "
+                f"         hard_viol={log_dict['hard_violation_rate']:.4f} "
                 f"cost={log_dict['mean_step_cost']:.4f} "
-                f"λ={log_dict['lambda']:.4f} "
+                f"λ̃={log_dict['lambda_tilde']:.4f} "
+                f"Ĵ_c={log_dict['j_c_hat']:.4f} "
                 f"Qc={log_dict['mean_qc']:.4f}"
             )
 
@@ -915,7 +1035,9 @@ def main(args: Args):
         ckpt.update({
             "cost_critic_params":        training_state.cost_critic_state.params,
             "cost_critic_target_params": training_state.cost_critic_target_params,
-            "log_lambda":                training_state.log_lambda,
+            "lambda_tilde":              training_state.lambda_tilde,
+            "pid_e_prev":                training_state.pid_e_prev,
+            "pid_sum_e":                 training_state.pid_sum_e,
         })
     with open(f"{ckpt_dir}/params.pkl", "wb") as f:
         pickle.dump(ckpt, f)

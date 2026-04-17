@@ -33,7 +33,8 @@ class CrlEvaluator():
                  episode_length, key,
                  cost_fn: Optional[Callable] = None,
                  cost_budget_d: Optional[float] = None,
-                 obs_dim: Optional[int] = None):
+                 obs_dim: Optional[int] = None,
+                 smooth_cost_fn: Optional[Callable] = None):
         """
         Args:
             actor_step: deterministic policy step function.
@@ -41,19 +42,21 @@ class CrlEvaluator():
             num_eval_envs: number of parallel eval environments.
             episode_length: steps per episode.
             key: JAX PRNGKey.
-            cost_fn: optional JAX-compatible function (agent_xy: [...,2]) ->
-                     cost: [...].  When provided, eval-time constraint metrics
-                     are computed: eval/mean_step_cost, eval/constraint_violation.
+            cost_fn: hard indicator cost function (agent_xy: [...,2]) -> [...].
+                     Used for interpretable constraint violation reporting.
             cost_budget_d: CMDP budget threshold d.  Required when cost_fn is set.
             obs_dim: state dimension (before goal concat) in the observation.
                      The first 2 dims of the state are assumed to be (x, y).
                      Required when cost_fn is set.
+            smooth_cost_fn: optional smooth sigmoid cost function for calibration
+                     comparison between training and eval costs.
         """
         self._key = key
         self._eval_walltime = 0.
         self._cost_fn = cost_fn
         self._cost_budget_d = cost_budget_d
         self._obs_dim = obs_dim
+        self._smooth_cost_fn = smooth_cost_fn
 
         eval_env = envs.training.EvalWrapper(eval_env)
 
@@ -77,8 +80,9 @@ class CrlEvaluator():
 
         Returns a dict of eval/* metrics plus all training_metrics.
         When cost_fn was provided at construction, also logs:
-            eval/mean_step_cost      — mean per-step cost across trajectory
-            eval/constraint_violation — max(0, mean_step_cost - budget)
+            eval/mean_hard_cost      — mean per-step hard indicator cost
+            eval/constraint_violation — max(0, mean_hard_cost - budget)
+            eval/mean_smooth_cost    — mean per-step smooth sigmoid cost (if provided)
         """
         self._key, unroll_key = jax.random.split(self._key)
 
@@ -121,19 +125,23 @@ class CrlEvaluator():
         # eval_data.observation: [episode_length, num_eval_envs, obs_size]
         # First 2 dims of the state portion are the agent (x, y) position.
         if self._cost_fn is not None and self._obs_dim is not None:
-            # Convert trajectory observations to numpy for cost computation.
-            # Shape: [T, N, obs_size] — the first 2 channels are (x, y).
             obs_np = np.array(eval_data.observation)          # [T, N, obs_size]
             xy_flat = obs_np[:, :, :2].reshape(-1, 2)         # [T*N, 2]
             xy_jax = jnp.array(xy_flat)
-            # cost_fn handles batched input [..., 2] -> [...]
-            step_costs = np.array(self._cost_fn(xy_jax))      # [T*N]
-            mean_step_cost = float(np.mean(step_costs))
+
+            # Hard indicator cost (interpretable)
+            hard_costs = np.array(self._cost_fn(xy_jax))      # [T*N]
+            mean_hard_cost = float(np.mean(hard_costs))
             constraint_violation = float(
-                max(0.0, mean_step_cost - self._cost_budget_d)
+                max(0.0, mean_hard_cost - self._cost_budget_d)
             )
-            metrics["eval/mean_step_cost"]      = mean_step_cost
+            metrics["eval/mean_hard_cost"]       = mean_hard_cost
             metrics["eval/constraint_violation"] = constraint_violation
+
+            # Smooth cost (for calibration comparison with training cost)
+            if self._smooth_cost_fn is not None:
+                smooth_costs = np.array(self._smooth_cost_fn(xy_jax))
+                metrics["eval/mean_smooth_cost"] = float(np.mean(smooth_costs))
 
         metrics["eval/avg_episode_length"] = np.mean(eval_metrics.episode_steps)
         metrics["eval/epoch_eval_time"] = epoch_eval_time

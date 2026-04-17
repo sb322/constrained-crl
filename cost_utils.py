@@ -1,10 +1,14 @@
 """
-cost_utils.py — Cost computation utilities for Constrained CRL.
+cost_utils.py — Cost computation utilities for SR-CPO (Constrained CRL).
 
 Provides:
   1. Wall-distance computation from known maze geometry.
-  2. Binary collision detection from MuJoCo contact forces.
-  3. Hybrid step cost: c(s,a,s') = α·1{contact} + (1-α)·exp(-d̄/σ).
+  2. Smooth sigmoid training cost: c(s) = σ((ε - d_wall(s)) / τ).
+  3. Hard indicator evaluation cost: c_eval(s) = 1{d_wall(s) < ε}.
+
+The smooth sigmoid is used during training for differentiability;
+the hard indicator is used at evaluation time for interpretable
+constraint violation metrics.
 
 All functions are JAX-compatible and JIT-safe.
 """
@@ -162,31 +166,59 @@ def compute_wall_distance(
     return d_min
 
 
-def hybrid_cost(
+def smooth_sigmoid_cost(
     agent_xy: jnp.ndarray,
     wall_centers: jnp.ndarray,
     half_wall_size: float,
-    alpha_cost: float = 0.5,
-    sigma_wall: float = 1.0,
-    contact_threshold: float = 0.1,
+    cost_epsilon: float = 0.1,
+    cost_tau: float = 0.1,
 ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    """Hybrid step cost: c = α·1{collision} + (1-α)·exp(-d/σ).
+    """Smooth sigmoid training cost: c(s) = σ((ε − d_wall(s)) / τ).
+
+    This is the SR-CPO training cost (Eq. in Constrained_CRL_Revision_v2.tex).
+    The sigmoid provides a differentiable approximation to the hard indicator
+    1{d_wall < ε}, with temperature τ controlling sharpness.
+
+    As τ → 0, this converges to the hard indicator.
+
+    Args:
+        agent_xy: [..., 2]  agent (x, y) positions.
+        wall_centers: [N, 2]  wall cell centers.
+        half_wall_size: float
+        cost_epsilon: proximity threshold ε — distance below which cost ≈ 1.
+        cost_tau: sigmoid temperature τ — smaller = sharper transition.
+
+    Returns:
+        cost: [...]  smooth cost in (0, 1).
+        d_wall: [...]  minimum wall distance (for logging).
+        hard_indicator: [...]  binary 1{d_wall < ε} (for eval metrics).
+    """
+    d_wall = compute_wall_distance(agent_xy, wall_centers, half_wall_size)
+    # c(s) = sigmoid((ε - d_wall) / τ) = 1 / (1 + exp((d_wall - ε) / τ))
+    cost = jax.nn.sigmoid((cost_epsilon - d_wall) / cost_tau)
+    hard_indicator = (d_wall < cost_epsilon).astype(jnp.float32)
+    return cost, d_wall, hard_indicator
+
+
+def hard_indicator_cost(
+    agent_xy: jnp.ndarray,
+    wall_centers: jnp.ndarray,
+    half_wall_size: float,
+    cost_epsilon: float = 0.1,
+) -> jnp.ndarray:
+    """Hard indicator evaluation cost: c_eval(s) = 1{d_wall(s) < ε}.
+
+    Used at evaluation time for interpretable constraint violation reporting.
+    NOT used during training (use smooth_sigmoid_cost instead).
 
     Args:
         agent_xy: [..., 2]
         wall_centers: [N, 2]
         half_wall_size: float
-        alpha_cost: weight on binary collision term.
-        sigma_wall: length-scale for proximity soft-cost.
-        contact_threshold: distance below which we declare collision.
+        cost_epsilon: proximity threshold ε.
 
     Returns:
-        cost: [...]  hybrid cost in [0, 1].
-        d_wall: [...]  minimum wall distance (for logging).
-        collision: [...]  binary collision indicator.
+        cost: [...]  binary cost in {0, 1}.
     """
     d_wall = compute_wall_distance(agent_xy, wall_centers, half_wall_size)
-    collision = (d_wall < contact_threshold).astype(jnp.float32)
-    proximity = jnp.exp(-d_wall / sigma_wall)
-    cost = alpha_cost * collision + (1.0 - alpha_cost) * proximity
-    return cost, d_wall, collision
+    return (d_wall < cost_epsilon).astype(jnp.float32)

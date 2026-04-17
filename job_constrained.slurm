@@ -33,18 +33,19 @@ uv run train.py \
     --vis_length 1000 \
     --save_buffer 0 \
     --use_constraints True \
-    --alpha_cost 0.5 \
-    --sigma_wall 1.0 \
-    --contact_threshold 0.1 \
+    --cost_epsilon 0.1 \
+    --cost_tau 0.05 \
     --cost_budget_d 0.1 \
-    --lambda_init 0.0 \
-    --lambda_lr 1e-3 \
+    --pid_kp 0.1 \
+    --pid_ki 0.003 \
+    --pid_kd 0.001 \
     --lambda_max 100.0 \
     --cost_critic_lr 3e-4 \
     --cost_critic_width 256 \
     --cost_critic_depth 4 \
     --cost_critic_tau 0.005 \
     --cost_discount 0.99 \
+    --dual_estimator_goals 64 \
     --seed 0 \
     --track True \
     --wandb_project "constrained-crl"
