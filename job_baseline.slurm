@@ -1,11 +1,14 @@
-#!/bin/bash
+#!/bin/bash -l
 #SBATCH --job-name=crl_ant_big_baseline
+#SBATCH --partition=gpu
+#SBATCH --account=ag2682
+#SBATCH --qos=high_ag2682
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem-per-cpu=16G
 #SBATCH --gres=gpu:1
-#SBATCH --constraint=gpu80
+#SBATCH --constraint=a100
 #SBATCH --time=24:00:00
 #SBATCH --output=logs/%x_%j.out
 #SBATCH --error=logs/%x_%j.err
