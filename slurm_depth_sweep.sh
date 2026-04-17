@@ -4,14 +4,13 @@
 #SBATCH --error=ccrl_sweep.%j.err
 #SBATCH --partition=gpu
 #SBATCH --account=ag2682
-#SBATCH --qos=high_ag2682
+#SBATCH --qos=standard
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:a100_40g:1
 #SBATCH --mem=32G
 #SBATCH --time=192:00:00
-#SBATCH --constraint=a100
 
 # Single job — all (depth × seed) runs sequentially on one A100.
 # Requests a full A100 (not MIG slice) via --constraint and generic gpu:1.

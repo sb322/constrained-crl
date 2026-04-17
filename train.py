@@ -607,11 +607,23 @@ def main(args: Args):
             subkey, shape=means_next.shape)
         action_next = nn.tanh(x_next)
 
-        # Plain cost-to-go target: y = c(s) + γ_c · Q_c^target(s', a', g)
-        # NOTE: No -α·log π term here. This is deliberate — the cost critic
-        # estimates the undiscounted/discounted cost stream, not a soft value.
+        # Plain cost-to-go target:
+        #
+        #     y_t = c(s_t) + γ_c · (1 − d_t) · Q_c^target(s_{t+1}, a', g)
+        #
+        # where d_t = 1{episode terminated at step t}.  The (1 − d_t) mask is
+        # ESSENTIAL: on terminal transitions, s_{t+1} is the post-reset state,
+        # and bootstrapping through it injects noise into the Q_c target
+        # (violates the Bellman contraction).  `transitions.discount` is
+        # stored as (1 − done) by the collector, so we can use it directly.
+        #
+        # NOTE: No −α·log π term here. Cost critic is plain cost-to-go, not
+        # a soft value (see SR-CPO theory §5.3).
+        done_mask = transitions.discount                    # 1 − d_t
         qc_target = cost_critic.apply(cost_critic_target_params, next_state, action_next, goal)
-        td_target = jax.lax.stop_gradient(cost + args.cost_discount * qc_target)
+        td_target = jax.lax.stop_gradient(
+            cost + args.cost_discount * done_mask * qc_target
+        )
 
         qc_online = cost_critic.apply(cost_critic_params, state, action, goal)
         loss = jnp.mean((qc_online - td_target) ** 2)
@@ -729,10 +741,24 @@ def main(args: Args):
                 goals, dual_key,
             )
 
-            # ── PID-Lagrangian update ─────────────────────────
-            # e_k = Ĵ_c - d  (constraint error: positive = violation)
+            # ── PID-Lagrangian update (Stooke et al., 2020) ──────
+            #
+            #     e_k  = Ĵ_c(π_θ) − d                (constraint error)
+            #     S_k  = clamp( S_{k−1} + e_k, ±S_max )   (anti-windup)
+            #     λ̃_k  = clip( K_p·e_k + K_i·S_k + K_d·(e_k − e_{k−1}),
+            #                   0, λ_max )
+            #
+            # Anti-windup rationale.  Without the clamp on S_k, once λ̃
+            # saturates at λ_max the integral keeps accumulating during a
+            # persistent violation, so when the violation subsides λ̃
+            # lags badly before descending.  We bound S_k so that the
+            # integral term alone cannot exceed λ_max:  |K_i·S_max| ≤ λ_max
+            # ⇒  S_max = λ_max / max(K_i, 1e−8).
             e_k = j_c_hat - args.cost_budget_d
-            pid_sum_e_new = training_state.pid_sum_e + e_k
+            s_max = args.lambda_max / jnp.maximum(args.pid_ki, 1e-8)
+            pid_sum_e_new = jnp.clip(
+                training_state.pid_sum_e + e_k, -s_max, s_max
+            )
             lambda_tilde_new = jnp.clip(
                 args.pid_kp * e_k
                 + args.pid_ki * pid_sum_e_new
