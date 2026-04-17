@@ -520,7 +520,11 @@ def main(args: Args):
         sa_repr = sa_encoder.apply(sa_enc_p, obs[:, :args.obs_dim], action)
         g_repr  = g_encoder.apply(g_enc_p, goal)
 
-        logits = -jnp.sqrt(jnp.sum((sa_repr[:, None, :] - g_repr[None, :, :]) ** 2, axis=-1))
+        # NaN-safe L2 distance: sqrt(x) has NaN gradient at x=0 in JAX (0/0).
+        # +1e-12 is outside FP32 representable noise floor for the sqrt output
+        # but ensures the gradient path is finite even when two reprs collide.
+        _d2 = jnp.sum((sa_repr[:, None, :] - g_repr[None, :, :]) ** 2, axis=-1)
+        logits = -jnp.sqrt(_d2 + 1e-12)
         logsumexp_val = jax.nn.logsumexp(logits, axis=1)
         loss = -jnp.mean(jnp.diag(logits) - logsumexp_val)
         loss += args.logsumexp_penalty_coeff * jnp.mean(logsumexp_val ** 2)
@@ -556,10 +560,11 @@ def main(args: Args):
         log_prob -= jnp.log((1 - jnp.square(action)) + 1e-6)
         log_prob = log_prob.sum(-1)
 
-        # Contrastive critic f(s,a,g) — this is the InfoNCE log-density ratio
+        # Contrastive critic f(s,a,g) — this is the InfoNCE log-density ratio.
+        # Same NaN-safe sqrt as in critic_loss_fn: avoids NaN gradient at x=0.
         sa_repr = sa_encoder.apply(critic_params["sa_encoder"], state, action)
         g_repr  = g_encoder.apply(critic_params["g_encoder"],  goal)
-        f_sa_g  = -jnp.sqrt(jnp.sum((sa_repr - g_repr) ** 2, axis=-1))
+        f_sa_g  = -jnp.sqrt(jnp.sum((sa_repr - g_repr) ** 2, axis=-1) + 1e-12)
 
         alpha = jnp.exp(log_alpha)
         # Preconditioned: divide f by ν_f to normalize InfoNCE scale
