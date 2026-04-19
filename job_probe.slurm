@@ -59,7 +59,9 @@ PY
 
 PIP_NVIDIA_LIBS=""
 for SITE in $PY_SITE; do
-    for subpkg in cudnn cusolver cublas cuda_runtime cuda_nvrtc cufft cuda_cupti cusparse nccl; do
+    # nvjitlink MUST precede cusparse so the loader finds the venv's newer
+    # libnvJitLink.so.12 (with 12.9 symbols) before any system CUDA 12.8 copy.
+    for subpkg in nvjitlink cudnn cusolver cublas cuda_runtime cuda_nvrtc cufft cuda_cupti cusparse nccl; do
         d="$SITE/nvidia/$subpkg/lib"
         [ -d "$d" ] && PIP_NVIDIA_LIBS="${PIP_NVIDIA_LIBS:+$PIP_NVIDIA_LIBS:}$d"
     done
