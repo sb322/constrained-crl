@@ -8,7 +8,7 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
 #SBATCH --gres=gpu:a100_40g:1
-#SBATCH --time=00:30:00
+#SBATCH --time=02:00:00
 #SBATCH --output=logs/%x_%j.out
 #SBATCH --error=logs/%x_%j.err
 
@@ -91,6 +91,13 @@ export XLA_PYTHON_CLIENT_MEM_FRACTION=0.90
 # ── stdout/stderr flushing (critical for visible epoch progress) ──
 export PYTHONUNBUFFERED=1
 export PYTHONFAULTHANDLER=1
+
+# ── JAX compilation cache: persist XLA compiles across runs ───────────────
+#  Without this, every new sbatch pays the full deep-8 trace cost again.
+#  With this, the second submission of the same jit signature loads in
+#  seconds instead of minutes.
+export JAX_COMPILATION_CACHE_DIR="$(pwd)/.jax_cache"
+mkdir -p "$JAX_COMPILATION_CACHE_DIR"
 
 echo "===== ENVIRONMENT ====="
 echo "HOST=$(hostname)"

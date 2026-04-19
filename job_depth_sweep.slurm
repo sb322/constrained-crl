@@ -1,5 +1,5 @@
 #!/bin/bash -l
-#SBATCH --job-name=ccrl_train
+#SBATCH --job-name=ccrl_depth
 #SBATCH --partition=gpu
 #SBATCH --account=ag2682
 #SBATCH --qos=standard
@@ -8,13 +8,43 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
 #SBATCH --gres=gpu:a100_40g:1
-#SBATCH --time=24:00:00
-#SBATCH --output=logs/%x_%j.out
-#SBATCH --error=logs/%x_%j.err
+#SBATCH --time=05:00:00
+#SBATCH --output=logs/%x_%A_%a.out
+#SBATCH --error=logs/%x_%A_%a.err
+#SBATCH --array=0-7
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  NJIT Wulver HPC — SR-CPO full training (single seed, Ant Big Maze)
-#  Submit:  sbatch job_train.slurm
+#  NJIT Wulver HPC — SR-CPO DEPTH ABLATION
+#
+#  Research question:
+#    How does network depth affect CMDP feasibility and constraint-violation
+#    behavior of SR-CPO on Ant Big Maze?  Specifically, does deeper actor/
+#    critic accelerate convergence of the Lagrangian (λ) and of the
+#    cost-critic estimate (Ĵ_c) toward the budget d, or does it just
+#    increase compile/step cost without improving constraint satisfaction?
+#
+#  Design:
+#    4 depths × 2 seeds = 8 array tasks, each a ~1–2 h run after its first
+#    jit-trace compile. Env, horizon, cost structure, PID gains, budget,
+#    env-step budget are held fixed at the baseline config — only actor_depth,
+#    critic_depth, actor_skip_connections, critic_skip_connections vary.
+#
+#  Grid:
+#    DEPTHS  = (2 4 6 8)               → actor_depth = critic_depth
+#    SEEDS   = (0 42)
+#    skip    = depth / 2               (so depth=2→skip=1, ..., depth=8→skip=4)
+#
+#    task_id  →  (depth, seed)
+#       0     →  (2,  0)    4     →  (6,  0)
+#       1     →  (2, 42)    5     →  (6, 42)
+#       2     →  (4,  0)    6     →  (8,  0)
+#       3     →  (4, 42)    7     →  (8, 42)
+#
+#  Wall budget per task:  5 h   (ceiling; most depths finish in well under 2 h)
+#  Env-step budget:       20M   (200 epochs × ~100k env-steps/epoch)
+#  wandb_group:           "depth_ablation"
+#
+#  Submit:  sbatch job_depth_sweep.slurm
 # ══════════════════════════════════════════════════════════════════════════════
 
 module purge
@@ -42,8 +72,6 @@ PY
 
 PIP_NVIDIA_LIBS=""
 for SITE in $PY_SITE; do
-    # nvjitlink MUST precede cusparse so the loader finds the venv's newer
-    # libnvJitLink.so.12 (with 12.9 symbols) before any system CUDA 12.8 copy.
     for subpkg in nvjitlink cudnn cusolver cublas cuda_runtime cuda_nvrtc cufft cuda_cupti cusparse nccl; do
         d="$SITE/nvidia/$subpkg/lib"
         [ -d "$d" ] && PIP_NVIDIA_LIBS="${PIP_NVIDIA_LIBS:+$PIP_NVIDIA_LIBS:}$d"
@@ -75,27 +103,27 @@ export XLA_PYTHON_CLIENT_MEM_FRACTION=0.90
 export PYTHONUNBUFFERED=1
 export PYTHONFAULTHANDLER=1
 
-# ── JAX compilation cache: persist XLA compiles across runs ───────────────
-#  First jit trace of the depth-8 fused actor+reward-critic+cost-critic+
-#  MJX-rollout kernel takes ~12 min on an A100. Persisting it to disk
-#  means a restart after a crash picks up in seconds instead of paying
-#  that cost again. Cache keys include shape, dtype, and flag signatures,
-#  so probe, train, and sweep have independent cache entries but share
-#  the directory.
+# ── JAX compilation cache ─────────────────────────────────────────────────
 export JAX_COMPILATION_CACHE_DIR="$(pwd)/.jax_cache"
 mkdir -p "$JAX_COMPILATION_CACHE_DIR"
 
-echo "===== ENVIRONMENT ====="
-echo "HOST=$(hostname)"
-nvidia-smi | head -20
+# ── Depth × seed grid ─────────────────────────────────────────────────────
+DEPTHS=(2 4 6 8)
+SEEDS=(0 42)
 
-echo ""
-echo "===== PIP NVIDIA PACKAGES ====="
-"$PYTHON" -m pip list 2>/dev/null | grep -i -E '^(nvidia|jax|jaxlib)' || echo "  (none found)"
+N_DEPTHS=${#DEPTHS[@]}
+N_SEEDS=${#SEEDS[@]}
 
-echo ""
-echo "===== LD_LIBRARY_PATH ====="
-echo "$LD_LIBRARY_PATH" | tr ':' '\n'
+SEED_IDX=$((  SLURM_ARRAY_TASK_ID               % N_SEEDS  ))
+DEPTH_IDX=$(( SLURM_ARRAY_TASK_ID               / N_SEEDS  ))
+
+DEPTH=${DEPTHS[$DEPTH_IDX]}
+SEED=${SEEDS[$SEED_IDX]}
+SKIP=$(( DEPTH / 2 ))
+
+echo "===== ARRAY TASK $SLURM_ARRAY_TASK_ID ====="
+echo "depth=$DEPTH  skip=$SKIP  seed=$SEED"
+nvidia-smi | head -5
 
 echo ""
 echo "===== cuSOLVER LOAD CHECK ====="
@@ -121,41 +149,27 @@ if not loaded:
     print("  FATAL: libcusolver.so could not be loaded from any LD_LIBRARY_PATH entry.")
     sys.exit(1)
 PYCHECK_LIB
-if [ $? -ne 0 ]; then echo "cuSOLVER preflight failed — JAX will not see the GPU."; exit 1; fi
+if [ $? -ne 0 ]; then echo "cuSOLVER preflight failed."; exit 1; fi
 
-echo ""
-echo "===== JAX GPU CHECK ====="
 "$PYTHON" - <<'PYCHECK'
 import jax
-print("jax.devices()     =", jax.devices())
-print("default_backend() =", jax.default_backend())
 assert jax.default_backend() == "gpu", "JAX did not detect the GPU"
+print("jax.devices() =", jax.devices())
 PYCHECK
 if [ $? -ne 0 ]; then echo "JAX GPU check failed."; exit 1; fi
 
-# ── Full SR-CPO training run ──────────────────────────────────────────────
-#  NOTE on throughput/visibility fixes (vs previous failed config):
-#   • --num_envs 512         → matches paper parallelism; doubles env throughput
-#   • --num_epochs 1000      → each jit_epoch() returns after ~100k env steps
-#                              (instead of 1M), so progress prints fire every
-#                              ~20–40 s. No change to total_env_steps.
-#   • --num_minibatches 8    → reduces SGD-steps-per-training_step from 128
-#                              (32 × 4) to 32 (8 × 4). Still matches batch
-#                              coverage at batch_size=512; removes the per-
-#                              epoch gradient-step bottleneck that we believe
-#                              caused epoch 1 to not return after 4+ hours.
-#   • -u + PYTHONUNBUFFERED  → per-epoch stdout prints flush immediately.
+# ── Depth-ablation run (20M env-steps / 200 epochs at baseline config) ────
 "$PYTHON" -u train.py \
     --env_id                "ant_big_maze" \
     --eval_env_id           "ant_big_maze_eval" \
-    --num_epochs            1000 \
-    --total_env_steps       100000000 \
+    --num_epochs            200 \
+    --total_env_steps       20000000 \
     --num_envs              512 \
     --num_minibatches       8 \
-    --critic_depth          8 \
-    --actor_depth           8 \
-    --actor_skip_connections 4 \
-    --critic_skip_connections 4 \
+    --critic_depth          "$DEPTH" \
+    --actor_depth           "$DEPTH" \
+    --actor_skip_connections "$SKIP" \
+    --critic_skip_connections "$SKIP" \
     --batch_size            512 \
     --vis_length            1000 \
     --save_buffer           0 \
@@ -173,9 +187,9 @@ if [ $? -ne 0 ]; then echo "JAX GPU check failed."; exit 1; fi
     --cost_critic_tau       0.005 \
     --cost_discount         0.99 \
     --dual_estimator_goals  64 \
-    --seed                  0 \
+    --seed                  "$SEED" \
     --track                 True \
     --wandb_project         "constrained-crl" \
-    --wandb_group           "main_run"
+    --wandb_group           "depth_ablation"
 
-echo "===== TRAIN RUN COMPLETE ====="
+echo "===== ARRAY TASK $SLURM_ARRAY_TASK_ID DONE ====="

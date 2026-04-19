@@ -1,5 +1,5 @@
 #!/bin/bash -l
-#SBATCH --job-name=ccrl_train
+#SBATCH --job-name=ccrl_short
 #SBATCH --partition=gpu
 #SBATCH --account=ag2682
 #SBATCH --qos=standard
@@ -8,13 +8,31 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
 #SBATCH --gres=gpu:a100_40g:1
-#SBATCH --time=24:00:00
+#SBATCH --time=06:00:00
 #SBATCH --output=logs/%x_%j.out
 #SBATCH --error=logs/%x_%j.err
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  NJIT Wulver HPC — SR-CPO full training (single seed, Ant Big Maze)
-#  Submit:  sbatch job_train.slurm
+#  NJIT Wulver HPC — SR-CPO OVERNIGHT SHORT RUN
+#
+#  Purpose:
+#    Produce a complete set of training curves by morning, guaranteed.
+#    Identical env, networks, and hyperparams to job_train.slurm, but with
+#    1/5 of the env-step budget so it finishes well inside the 6 h walltime
+#    (expected wall: ~12 min compile + ~15–60 min training = 30 min – 1 h).
+#
+#    This is the "safety-net" run: if the 24 h full training job hasn't
+#    finished by morning, this one will have, and gives you the baseline
+#    (budget=0.1, ki=0.003, seed=0) curves needed to show the method
+#    is working.
+#
+#  Config differences vs job_train.slurm (everything else identical):
+#    --total_env_steps 20000000  (was 100000000) → 1/5 of the total work
+#    --num_epochs      200       (was 1000)      → 200 epoch prints
+#    #SBATCH --time    06:00:00  (was 24:00:00)  → 6 h walltime ceiling
+#    --wandb_group     "short_overnight"         (keeps separate in wandb)
+#
+#  Submit:  sbatch job_train_short.slurm
 # ══════════════════════════════════════════════════════════════════════════════
 
 module purge
@@ -76,26 +94,12 @@ export PYTHONUNBUFFERED=1
 export PYTHONFAULTHANDLER=1
 
 # ── JAX compilation cache: persist XLA compiles across runs ───────────────
-#  First jit trace of the depth-8 fused actor+reward-critic+cost-critic+
-#  MJX-rollout kernel takes ~12 min on an A100. Persisting it to disk
-#  means a restart after a crash picks up in seconds instead of paying
-#  that cost again. Cache keys include shape, dtype, and flag signatures,
-#  so probe, train, and sweep have independent cache entries but share
-#  the directory.
 export JAX_COMPILATION_CACHE_DIR="$(pwd)/.jax_cache"
 mkdir -p "$JAX_COMPILATION_CACHE_DIR"
 
 echo "===== ENVIRONMENT ====="
 echo "HOST=$(hostname)"
 nvidia-smi | head -20
-
-echo ""
-echo "===== PIP NVIDIA PACKAGES ====="
-"$PYTHON" -m pip list 2>/dev/null | grep -i -E '^(nvidia|jax|jaxlib)' || echo "  (none found)"
-
-echo ""
-echo "===== LD_LIBRARY_PATH ====="
-echo "$LD_LIBRARY_PATH" | tr ':' '\n'
 
 echo ""
 echo "===== cuSOLVER LOAD CHECK ====="
@@ -133,23 +137,12 @@ assert jax.default_backend() == "gpu", "JAX did not detect the GPU"
 PYCHECK
 if [ $? -ne 0 ]; then echo "JAX GPU check failed."; exit 1; fi
 
-# ── Full SR-CPO training run ──────────────────────────────────────────────
-#  NOTE on throughput/visibility fixes (vs previous failed config):
-#   • --num_envs 512         → matches paper parallelism; doubles env throughput
-#   • --num_epochs 1000      → each jit_epoch() returns after ~100k env steps
-#                              (instead of 1M), so progress prints fire every
-#                              ~20–40 s. No change to total_env_steps.
-#   • --num_minibatches 8    → reduces SGD-steps-per-training_step from 128
-#                              (32 × 4) to 32 (8 × 4). Still matches batch
-#                              coverage at batch_size=512; removes the per-
-#                              epoch gradient-step bottleneck that we believe
-#                              caused epoch 1 to not return after 4+ hours.
-#   • -u + PYTHONUNBUFFERED  → per-epoch stdout prints flush immediately.
+# ── Overnight short run: 20M env-steps / 200 epochs at baseline config ────
 "$PYTHON" -u train.py \
     --env_id                "ant_big_maze" \
     --eval_env_id           "ant_big_maze_eval" \
-    --num_epochs            1000 \
-    --total_env_steps       100000000 \
+    --num_epochs            200 \
+    --total_env_steps       20000000 \
     --num_envs              512 \
     --num_minibatches       8 \
     --critic_depth          8 \
@@ -176,6 +169,6 @@ if [ $? -ne 0 ]; then echo "JAX GPU check failed."; exit 1; fi
     --seed                  0 \
     --track                 True \
     --wandb_project         "constrained-crl" \
-    --wandb_group           "main_run"
+    --wandb_group           "short_overnight"
 
-echo "===== TRAIN RUN COMPLETE ====="
+echo "===== SHORT RUN COMPLETE ====="

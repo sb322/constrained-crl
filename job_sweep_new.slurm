@@ -77,6 +77,16 @@ export XLA_PYTHON_CLIENT_MEM_FRACTION=0.90
 export PYTHONUNBUFFERED=1
 export PYTHONFAULTHANDLER=1
 
+# ── JAX compilation cache: persist XLA compiles across runs ───────────────
+#  First jit trace of the depth-8 fused kernel takes ~12 min on an A100.
+#  Persisting to disk lets subsequent array tasks with the same jit
+#  signature (same seed-independent shape/dtype/flag structure) skip
+#  recompilation. Each sweep task still needs to compile the first time
+#  its specific signature is seen, but 12-task arrays sharing a cache
+#  amortize the cost.
+export JAX_COMPILATION_CACHE_DIR="$(pwd)/.jax_cache"
+mkdir -p "$JAX_COMPILATION_CACHE_DIR"
+
 # ── Sweep grid ─────────────────────────────────────────────────────────────
 BUDGETS=(0.05 0.1 0.2)
 PID_KIS=(0.003 0.001)
