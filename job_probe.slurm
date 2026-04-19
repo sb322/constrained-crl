@@ -1,5 +1,5 @@
 #!/bin/bash -l
-#SBATCH --job-name=ccrl_train
+#SBATCH --job-name=ccrl_probe
 #SBATCH --partition=gpu
 #SBATCH --account=ag2682
 #SBATCH --qos=standard
@@ -8,13 +8,30 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
 #SBATCH --gres=gpu:a100_40g:1
-#SBATCH --time=24:00:00
+#SBATCH --time=00:30:00
 #SBATCH --output=logs/%x_%j.out
 #SBATCH --error=logs/%x_%j.err
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  NJIT Wulver HPC — SR-CPO full training (single seed, Ant Big Maze)
-#  Submit:  sbatch job_train.slurm
+#  NJIT Wulver HPC — FAST PROBE for SR-CPO (Constrained CRL)
+#
+#  Purpose:
+#    Before launching long runs, confirm that the pipeline actually completes
+#    an epoch at the FULL env + network config (ant_big_maze, depth 8) within
+#    a few minutes.  If epoch 1 does not return in < 10 minutes here, there's
+#    a real bug in training_epoch to hunt — otherwise the full run will work.
+#
+#  Config differences vs job_train.slurm (everything else identical):
+#    --total_env_steps 500000   (was 100000000) → 1/200 of the total work
+#    --num_epochs      5        (was 1000)      → 5 epoch prints expected
+#    --num_minibatches 4        (was 32)        → smaller SGD inner-loop
+#    --num_update_epochs 1      (was 4)         → "
+#    --eval_every 5             (eval only at the end)
+#    --wandb_group "probe"      (keeps probes separate in wandb)
+#
+#  Expected wall time:  ≤ 10 minutes end-to-end.
+#
+#  Submit:  sbatch job_probe.slurm
 # ══════════════════════════════════════════════════════════════════════════════
 
 module purge
@@ -78,14 +95,6 @@ echo "HOST=$(hostname)"
 nvidia-smi | head -20
 
 echo ""
-echo "===== PIP NVIDIA PACKAGES ====="
-"$PYTHON" -m pip list 2>/dev/null | grep -i -E '^(nvidia|jax|jaxlib)' || echo "  (none found)"
-
-echo ""
-echo "===== LD_LIBRARY_PATH ====="
-echo "$LD_LIBRARY_PATH" | tr ':' '\n'
-
-echo ""
 echo "===== cuSOLVER LOAD CHECK ====="
 "$PYTHON" - <<'PYCHECK_LIB'
 import ctypes, os, sys
@@ -121,25 +130,16 @@ assert jax.default_backend() == "gpu", "JAX did not detect the GPU"
 PYCHECK
 if [ $? -ne 0 ]; then echo "JAX GPU check failed."; exit 1; fi
 
-# ── Full SR-CPO training run ──────────────────────────────────────────────
-#  NOTE on throughput/visibility fixes (vs previous failed config):
-#   • --num_envs 512         → matches paper parallelism; doubles env throughput
-#   • --num_epochs 1000      → each jit_epoch() returns after ~100k env steps
-#                              (instead of 1M), so progress prints fire every
-#                              ~20–40 s. No change to total_env_steps.
-#   • --num_minibatches 8    → reduces SGD-steps-per-training_step from 128
-#                              (32 × 4) to 32 (8 × 4). Still matches batch
-#                              coverage at batch_size=512; removes the per-
-#                              epoch gradient-step bottleneck that we believe
-#                              caused epoch 1 to not return after 4+ hours.
-#   • -u + PYTHONUNBUFFERED  → per-epoch stdout prints flush immediately.
+# ── Fast probe — full env + networks, tiny workload ──────────────────────
 "$PYTHON" -u train.py \
     --env_id                "ant_big_maze" \
     --eval_env_id           "ant_big_maze_eval" \
-    --num_epochs            1000 \
-    --total_env_steps       100000000 \
+    --num_epochs            5 \
+    --total_env_steps       500000 \
     --num_envs              512 \
-    --num_minibatches       8 \
+    --num_minibatches       4 \
+    --num_update_epochs     1 \
+    --eval_every            5 \
     --critic_depth          8 \
     --actor_depth           8 \
     --actor_skip_connections 4 \
@@ -164,6 +164,6 @@ if [ $? -ne 0 ]; then echo "JAX GPU check failed."; exit 1; fi
     --seed                  0 \
     --track                 True \
     --wandb_project         "constrained-crl" \
-    --wandb_group           "main_run"
+    --wandb_group           "probe"
 
-echo "===== TRAIN RUN COMPLETE ====="
+echo "===== PROBE RUN COMPLETE ====="

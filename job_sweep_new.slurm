@@ -36,20 +36,44 @@ export PATH="$VENV/bin:$PATH"
 echo "Using PYTHON=$PYTHON  (cwd=$(pwd))"
 
 PY_SITE=$("$PYTHON" - <<'PY'
-import site; print(site.getsitepackages()[0])
+import site
+for p in site.getsitepackages():
+    print(p)
 PY
 )
 
 PIP_NVIDIA_LIBS=""
-for subpkg in cudnn cusolver cublas cuda_runtime cuda_nvrtc cufft cuda_cupti cusparse; do
-    d="$PY_SITE/nvidia/$subpkg/lib"
-    [ -d "$d" ] && PIP_NVIDIA_LIBS="${PIP_NVIDIA_LIBS:+$PIP_NVIDIA_LIBS:}$d"
+for SITE in $PY_SITE; do
+    for subpkg in cudnn cusolver cublas cuda_runtime cuda_nvrtc cufft cuda_cupti cusparse nccl; do
+        d="$SITE/nvidia/$subpkg/lib"
+        [ -d "$d" ] && PIP_NVIDIA_LIBS="${PIP_NVIDIA_LIBS:+$PIP_NVIDIA_LIBS:}$d"
+    done
 done
+
+if ! echo "$PIP_NVIDIA_LIBS" | grep -q cusolver; then
+    echo "[warn] canonical nvidia/*/lib layout not found — falling back to find()"
+    FOUND=$(find "$VENV" -name 'libcusolver.so*' -not -path '*/torch/*' 2>/dev/null | head -1)
+    if [ -n "$FOUND" ]; then
+        EXTRA=$(dirname "$FOUND")
+        PIP_NVIDIA_LIBS="${PIP_NVIDIA_LIBS:+$PIP_NVIDIA_LIBS:}$EXTRA"
+        NVIDIA_ROOT=$(echo "$EXTRA" | sed 's|/nvidia/.*||')/nvidia
+        if [ -d "$NVIDIA_ROOT" ]; then
+            for sub in "$NVIDIA_ROOT"/*/lib; do
+                [ -d "$sub" ] && PIP_NVIDIA_LIBS="${PIP_NVIDIA_LIBS}:$sub"
+            done
+        fi
+    fi
+fi
+
 SYS_CUDA_LIB="/apps/easybuild/el9_5.x86_64/software/CUDA/12.8.0/lib64"
 export LD_LIBRARY_PATH="${PIP_NVIDIA_LIBS}:${SYS_CUDA_LIB}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
 export XLA_PYTHON_CLIENT_MEM_FRACTION=0.90
+
+# ── stdout/stderr flushing (critical for visible epoch progress) ──
+export PYTHONUNBUFFERED=1
+export PYTHONFAULTHANDLER=1
 
 # ── Sweep grid ─────────────────────────────────────────────────────────────
 BUDGETS=(0.05 0.1 0.2)
@@ -73,6 +97,40 @@ echo "===== ARRAY TASK $SLURM_ARRAY_TASK_ID ====="
 echo "budget=$BUDGET  pid_ki=$KI  seed=$SEED"
 nvidia-smi | head -5
 
+echo ""
+echo "===== PIP NVIDIA PACKAGES ====="
+"$PYTHON" -m pip list 2>/dev/null | grep -i -E '^(nvidia|jax|jaxlib)' || echo "  (none found)"
+
+echo ""
+echo "===== LD_LIBRARY_PATH ====="
+echo "$LD_LIBRARY_PATH" | tr ':' '\n'
+
+echo ""
+echo "===== cuSOLVER LOAD CHECK ====="
+"$PYTHON" - <<'PYCHECK_LIB'
+import ctypes, os, sys
+paths = os.environ.get('LD_LIBRARY_PATH', '').split(':')
+loaded = False
+for p in paths:
+    for name in ('libcusolver.so.11', 'libcusolver.so'):
+        lib = os.path.join(p, name)
+        if os.path.exists(lib):
+            print(f"  found: {lib}")
+            try:
+                ctypes.CDLL(lib)
+                print(f"  loaded OK: {lib}")
+                loaded = True
+                break
+            except Exception as e:
+                print(f"  load FAILED: {e}")
+    if loaded:
+        break
+if not loaded:
+    print("  FATAL: libcusolver.so could not be loaded from any LD_LIBRARY_PATH entry.")
+    sys.exit(1)
+PYCHECK_LIB
+if [ $? -ne 0 ]; then echo "cuSOLVER preflight failed."; exit 1; fi
+
 "$PYTHON" - <<'PYCHECK'
 import jax
 assert jax.default_backend() == "gpu", "JAX did not detect the GPU"
@@ -80,11 +138,15 @@ print("jax.devices() =", jax.devices())
 PYCHECK
 if [ $? -ne 0 ]; then echo "JAX GPU check failed."; exit 1; fi
 
-"$PYTHON" train.py \
+# Same throughput/visibility fixes as job_train.slurm: num_envs=512,
+# num_epochs=1000, num_minibatches=8, -u / PYTHONUNBUFFERED.
+"$PYTHON" -u train.py \
     --env_id                "ant_big_maze" \
     --eval_env_id           "ant_big_maze_eval" \
-    --num_epochs            100 \
+    --num_epochs            1000 \
     --total_env_steps       100000000 \
+    --num_envs              512 \
+    --num_minibatches       8 \
     --critic_depth          8 \
     --actor_depth           8 \
     --actor_skip_connections 4 \
