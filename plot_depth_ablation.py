@@ -45,42 +45,60 @@ LINE1_RE = re.compile(
     r"c_loss=([-\d.eE+]+)\s+acc=([-\d.eE+]+)\s+\|\s+"
     r"a_loss=([-\d.eE+]+)\s+\|\s+t=([-\d.eE+]+)s"
 )
-LINE2_RE = re.compile(
-    r"hard_viol=([-\d.eE+]+)\s+cost=([-\d.eE+]+)\s+"
-    r"\u03bb=([-\d.eE+]+)\s+"            # λ
-    r"\u0134_c=([-\d.eE+]+)\s+"          # Ĵ_c
-    r"Qc=([-\d.eE+]+)"
-)
-HDR_RE = re.compile(r"depth=(\d+)\s+skip=\d+\s+seed=(\d+)")
+# Line 2 has Unicode chars (λ, Ĵ_c) whose exact encoding varies by terminal.
+# Detect the line by its reliable prefix and extract numeric fields in order:
+#   hard_viol=X cost=Y <unicode>=Z <unicode>=W Qc=V
+FLOAT = r"([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)"
+LINE2_PREFIX_RE = re.compile(r"hard_viol\s*=")
+LINE2_NUMS_RE = re.compile(FLOAT)
+HDR_RE = re.compile(r"depth\s*=\s*(\d+)\s+skip\s*=\s*\d+\s+seed\s*=\s*(\d+)")
 
 
-def parse_log(path):
+def parse_log(path, debug=False):
     """Return dict(depth, seed, rows=[...], path) or None if unparseable."""
     with open(path, "r", errors="ignore") as f:
         text = f.read()
 
     hdr = HDR_RE.search(text)
     if not hdr:
-        print(f"  [skip] {path}: no 'depth=... seed=...' header", file=sys.stderr)
+        print(f"  [skip] {path}: no 'depth=... seed=...' header",
+              file=sys.stderr)
+        if debug:
+            # Show what headers DO look like
+            for ln in text.splitlines()[:40]:
+                if "depth" in ln or "seed" in ln:
+                    print(f"    candidate header line: {ln!r}",
+                          file=sys.stderr)
         return None
     depth = int(hdr.group(1))
     seed = int(hdr.group(2))
 
     rows = []
     lines = text.splitlines()
+    line1_count = 0
+    line2_count = 0
     for i, line in enumerate(lines):
         m1 = LINE1_RE.search(line)
         if not m1:
             continue
+        line1_count += 1
         # Companion metric line may be the next line or the one after
-        m2 = None
+        m2_line = None
         for j in (1, 2):
-            if i + j < len(lines):
-                m2 = LINE2_RE.search(lines[i + j])
-                if m2:
-                    break
-        if m2 is None:
+            if i + j < len(lines) and LINE2_PREFIX_RE.search(lines[i + j]):
+                m2_line = lines[i + j]
+                break
+        if m2_line is None:
             continue
+        line2_count += 1
+
+        nums = LINE2_NUMS_RE.findall(m2_line)
+        if len(nums) < 5:
+            if debug:
+                print(f"    [warn] only {len(nums)} numbers on line-2: "
+                      f"{m2_line!r}", file=sys.stderr)
+            continue
+        hard_viol, cost, lam, j_c, qc = [float(n) for n in nums[:5]]
 
         rows.append(dict(
             epoch=int(m1.group(1)),
@@ -89,12 +107,25 @@ def parse_log(path):
             acc=float(m1.group(4)),
             a_loss=float(m1.group(5)),
             t=float(m1.group(6)),
-            hard_viol=float(m2.group(1)),
-            cost=float(m2.group(2)),
-            lam=float(m2.group(3)),
-            j_c=float(m2.group(4)),
-            qc=float(m2.group(5)),
+            hard_viol=hard_viol,
+            cost=cost,
+            lam=lam,
+            j_c=j_c,
+            qc=qc,
         ))
+    if debug and not rows:
+        print(f"  [debug] {os.path.basename(path)}: "
+              f"line1_matches={line1_count}  line2_matches={line2_count}",
+              file=sys.stderr)
+        # Show the first few candidate lines so we can see the actual format
+        for ln in lines:
+            if "[ " in ln and "/" in ln and "steps=" in ln:
+                print(f"    sample line-1: {ln!r}", file=sys.stderr)
+                break
+        for ln in lines:
+            if "hard_viol" in ln:
+                print(f"    sample line-2: {ln!r}", file=sys.stderr)
+                break
     return dict(depth=depth, seed=seed, rows=rows, path=path)
 
 
@@ -106,13 +137,18 @@ def main():
     ap.add_argument("--csv", default="depth_ablation.csv")
     ap.add_argument("--budget", type=float, default=0.1,
                     help="cost budget d (drawn as reference line)")
+    ap.add_argument("--debug", action="store_true",
+                    help="print parsing diagnostics for failed files")
     args = ap.parse_args()
 
     runs = []
     for pat in args.logs:
         for path in sorted(glob.glob(pat)):
-            r = parse_log(path)
+            r = parse_log(path, debug=args.debug)
             if r is None or not r["rows"]:
+                if args.debug and r is not None:
+                    print(f"  [skip] {os.path.basename(path)}: "
+                          f"0 epoch-rows parsed", file=sys.stderr)
                 continue
             runs.append(r)
             print(f"  parsed {os.path.basename(path)}: "
