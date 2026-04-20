@@ -8,7 +8,7 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
 #SBATCH --gres=gpu:a100_40g:1
-#SBATCH --time=05:00:00
+#SBATCH --time=08:00:00
 #SBATCH --output=logs/%x_%A_%a.out
 #SBATCH --error=logs/%x_%A_%a.err
 #SBATCH --array=0-7
@@ -40,9 +40,14 @@
 #       2     →  (4,  0)    6     →  (8,  0)
 #       3     →  (4, 42)    7     →  (8, 42)
 #
-#  Wall budget per task:  5 h   (ceiling; most depths finish in well under 2 h)
+#  Wall budget per task:  8 h   (v2: up from 5 h so we can reach the first
+#                                activation of the PID-Lagrangian, which v1
+#                                extrapolated to ~2.5–3 M env-steps)
 #  Env-step budget:       20M   (200 epochs × ~100k env-steps/epoch)
-#  wandb_group:           "depth_ablation"
+#  Throughput fix (v2):   --num_update_epochs 2  (was default 4)
+#                         halves the SGD work per training_step, so
+#                         per-epoch wall drops from ~20 min → ~10 min.
+#  wandb_group:           "depth_ablation_v2"
 #
 #  Submit:  sbatch job_depth_sweep.slurm
 # ══════════════════════════════════════════════════════════════════════════════
@@ -158,7 +163,17 @@ print("jax.devices() =", jax.devices())
 PYCHECK
 if [ $? -ne 0 ]; then echo "JAX GPU check failed."; exit 1; fi
 
-# ── Depth-ablation run (20M env-steps / 200 epochs at baseline config) ────
+# ── Depth-ablation run (v2: --num_update_epochs 2 — halves per-epoch SGD) ─
+#  Change vs v1:
+#    --num_update_epochs 2  (was default 4)  → ~2× throughput per epoch.
+#    #SBATCH --time 08:00:00 (was 05:00:00)  → 8 h budget so we can reach
+#                                              Ĵ_c > d = 0.1 (the PID-
+#                                              Lagrangian activation point).
+#    --wandb_group "depth_ablation_v2"       → keeps v1 and v2 separate.
+#  Expected per-epoch cost at depth=8: ~10 min (vs ~20 min in v1).
+#  Expected epochs in 8 h at depth=8:  ~40–45  →  ~4 M env-steps.
+#  That is past the Ĵ_c = 0.1 crossing projected from v1 (~2.5–3 M steps),
+#  so v2 should capture the first evidence of the active-constraint regime.
 "$PYTHON" -u train.py \
     --env_id                "ant_big_maze" \
     --eval_env_id           "ant_big_maze_eval" \
@@ -166,6 +181,7 @@ if [ $? -ne 0 ]; then echo "JAX GPU check failed."; exit 1; fi
     --total_env_steps       20000000 \
     --num_envs              512 \
     --num_minibatches       8 \
+    --num_update_epochs     2 \
     --critic_depth          "$DEPTH" \
     --actor_depth           "$DEPTH" \
     --actor_skip_connections "$SKIP" \
@@ -190,6 +206,6 @@ if [ $? -ne 0 ]; then echo "JAX GPU check failed."; exit 1; fi
     --seed                  "$SEED" \
     --track                 True \
     --wandb_project         "constrained-crl" \
-    --wandb_group           "depth_ablation"
+    --wandb_group           "depth_ablation_v2"
 
 echo "===== ARRAY TASK $SLURM_ARRAY_TASK_ID DONE ====="
