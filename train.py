@@ -84,11 +84,30 @@ class Args:
 
     # ── SR-CPO Constrained additions ─────────────────────────────
     use_constraints: bool = True
-    # Smooth sigmoid cost: c(s) = σ((ε − d_wall) / τ)
-    cost_epsilon: float = 0.1        # proximity threshold ε
-    cost_tau: float = 0.05           # sigmoid temperature τ (smaller = sharper)
-    # CMDP budget
-    cost_budget_d: float = 0.1
+    # Training-cost shape — see envs/ant_maze.py::__init__ docstring.
+    #   "quadratic":  c_train(s) = (1 − d_wall/ε_train)²  on d_wall ≤ ε_train, else 0
+    #                 c_hard (s) = 1{d_wall < ε_hard}                (independent threshold)
+    #   "sigmoid"  :  c_train(s) = σ((ε − d_wall)/τ)                 (legacy; ignores ε_hard)
+    # "quadratic" is the default after run 962826 showed the sigmoid
+    # collapses to ~10⁻¹⁵ outside the tight d_wall<ε band and produces
+    # vacuous safety.  Hard-indicator C4 calibration uses ε_hard.
+    cost_type: str = "quadratic"
+    # Under quadratic: ε_train — shaping bandwidth (compact support).  Default
+    # 2.0 matches the ant_big_maze corridor half-width (maze_size_scaling=4.0,
+    # half_wall_size=2.0 → interior d_wall ∈ [0, 2.0] for typical trajectories).
+    # A dense-grid sweep of the interior shows ε_train=2.0 gives nonzero cost
+    # at ~88 % of interior positions; ε_train=0.3 covers only ~9 %, leaving
+    # the cost field as vacuous as the original sigmoid.
+    # Under sigmoid (legacy): ε — threshold inside σ((ε − d_wall)/τ).
+    cost_epsilon: float = 2.0
+    # Hard-indicator threshold ε_hard — only used under cost_type="quadratic".
+    # Kept strictly smaller than cost_epsilon so the shaping band properly
+    # surrounds the violation band (ε_hard < ε_train decouples accounting
+    # from shaping, mirroring the CBF safety-filter design).
+    cost_epsilon_hard: float = 0.1
+    cost_tau: float = 0.05           # sigmoid temperature τ (legacy path only)
+    # CMDP budget  — interpreted against the hard-indicator under quadratic.
+    cost_budget_d: float = 0.15
     lambda_max: float = 100.0
     # PID-Lagrangian dual update (replaces simple gradient ascent)
     pid_kp: float = 0.1             # proportional gain
@@ -294,19 +313,48 @@ def main(args: Args):
     # ── Environment ────────────────────────────────────────────
     # Use brax's training wrapper so state.info["state_extras"] is populated.
     # This gives us seed (episode ID) and truncation flags that flatten_crl_fn needs.
-    raw_env = envs.get_environment(args.env_id)
+    #
+    # PHASE-1 FIX: Ant envs default to `exclude_current_positions_from_observation=True`,
+    # which strips torso (x, y) from the observation.  With that, the CRL
+    # goal-relabel slice `future_state[:, 0:3]` becomes `[z, quat_x, quat_y]`
+    # instead of `[x, y, z]`, so the contrastive critic learns on a pose-
+    # ambiguous goal and the task reward stops descending.  Humanoid mazes
+    # don't have this problem (humanoid_maze._get_obs does NOT strip xy), so
+    # we only override the kwarg for ant_* envs.  The safety-cost computation
+    # uses pipeline_state.x.pos[0, :2] internally (Phase-0 fix) and is
+    # unaffected either way.
+    env_kwargs = {}
+    if args.env_id.startswith("ant_"):
+        env_kwargs["exclude_current_positions_from_observation"] = False
+    # Safety-cost kwargs — only the ant_maze env currently honors these; other
+    # envs ignore unknown kwargs via **kwargs passthrough.  We still gate on
+    # ant_* to keep the humanoid path exactly as before.
+    if args.use_constraints and args.env_id.startswith("ant_"):
+        env_kwargs["cost_type"]          = args.cost_type
+        env_kwargs["cost_epsilon"]       = args.cost_epsilon
+        env_kwargs["cost_epsilon_hard"]  = args.cost_epsilon_hard
+        env_kwargs["cost_tau"]           = args.cost_tau
+    raw_env = envs.get_environment(args.env_id, **env_kwargs)
     env = envs.training.wrap(
         raw_env,
         episode_length=args.episode_length,
         action_repeat=args.action_repeat,
     )
     eval_env_id = args.eval_env_id if args.eval_env_id else args.env_id
+    eval_env_kwargs = {}
+    if eval_env_id.startswith("ant_"):
+        eval_env_kwargs["exclude_current_positions_from_observation"] = False
+    if args.use_constraints and eval_env_id.startswith("ant_"):
+        eval_env_kwargs["cost_type"]          = args.cost_type
+        eval_env_kwargs["cost_epsilon"]       = args.cost_epsilon
+        eval_env_kwargs["cost_epsilon_hard"]  = args.cost_epsilon_hard
+        eval_env_kwargs["cost_tau"]           = args.cost_tau
     # Wrap eval env with brax's training wrappers so the evaluator can pass a
     # batched PRNG key of shape (num_eval_envs,) to reset(). Without VmapWrapper
     # the underlying ant_maze.reset sees shape (N,) and jax.random.split raises
     # "split accepts a single key, but was given a key array of shape (N,)".
     eval_env = envs.training.wrap(
-        envs.get_environment(eval_env_id),
+        envs.get_environment(eval_env_id, **eval_env_kwargs),
         episode_length=args.episode_length,
         action_repeat=args.action_repeat,
     )
@@ -438,6 +486,14 @@ def main(args: Args):
                                                       # Must match the shape that
                                                       # collect_step / prefill_one
                                                       # actually insert.
+            # Phase-0 safety-cost scalars, emitted by the env's step() from the
+            # authoritative torso position (pipeline_state.x.pos[0, :2]).
+            # These replace the old state[:, :2] slicing path in
+            # cost_critic_loss_fn, which was reading [z, quat_w] under the
+            # default exclude_current_positions_from_observation=True.
+            "cost":            jnp.zeros(()),
+            "d_wall":          jnp.zeros(()),
+            "hard_violation":  jnp.zeros(()),
         },
     )
 
@@ -469,26 +525,43 @@ def main(args: Args):
         )
         return next_env_state, transition
 
-    # Eval-time cost function — uses hard indicator for interpretable metrics.
-    # Returns scalar cost for each xy position: (xy: [...,2]) -> [...].
+    # Eval-time hard-indicator cost — uses ε_hard under the quadratic scheme so
+    # "violation" is measured against the tight threshold (not the shaping band).
+    # Under the legacy sigmoid path ε_hard is irrelevant; we fall back to ε.
+    _eps_hard = (
+        args.cost_epsilon_hard if args.cost_type == "quadratic" else args.cost_epsilon
+    )
     if args.use_constraints:
         def eval_cost_fn(xy: jnp.ndarray) -> jnp.ndarray:
             return hard_indicator_cost(
                 xy, wall_centers, half_wall_size,
-                cost_epsilon=args.cost_epsilon,
+                cost_epsilon=_eps_hard,
             )
     else:
         eval_cost_fn = None
 
-    # Smooth cost function for calibration tracking at eval time
+    # Calibration-tracking smooth cost at eval time.  Must mirror the *training*
+    # cost shape so C4 (|train_cost − eval_smooth_cost|) is meaningful.
     if args.use_constraints:
-        def eval_smooth_cost_fn(xy: jnp.ndarray) -> jnp.ndarray:
-            cost, _, _ = smooth_sigmoid_cost(
-                xy, wall_centers, half_wall_size,
-                cost_epsilon=args.cost_epsilon,
-                cost_tau=args.cost_tau,
-            )
-            return cost
+        if args.cost_type == "quadratic":
+            from cost_utils import compact_quadratic_cost
+            _eps_train = args.cost_epsilon
+            _eps_hard_local = args.cost_epsilon_hard
+            def eval_smooth_cost_fn(xy: jnp.ndarray) -> jnp.ndarray:
+                cost, _, _ = compact_quadratic_cost(
+                    xy, wall_centers, half_wall_size,
+                    cost_epsilon_train=_eps_train,
+                    cost_epsilon_hard=_eps_hard_local,
+                )
+                return cost
+        else:  # legacy sigmoid
+            def eval_smooth_cost_fn(xy: jnp.ndarray) -> jnp.ndarray:
+                cost, _, _ = smooth_sigmoid_cost(
+                    xy, wall_centers, half_wall_size,
+                    cost_epsilon=args.cost_epsilon,
+                    cost_tau=args.cost_tau,
+                )
+                return cost
     else:
         eval_smooth_cost_fn = None
 
@@ -604,13 +677,18 @@ def main(args: Args):
         next_state   = transitions.extras["next_state"]
         goal         = future_state[:, args.goal_start_idx:args.goal_end_idx]
 
-        # Smooth sigmoid cost on current state
-        agent_xy = state[:, :2]
-        cost, d_wall, hard_indicator = smooth_sigmoid_cost(
-            agent_xy, wall_centers, half_wall_size,
-            cost_epsilon=args.cost_epsilon,
-            cost_tau=args.cost_tau,
-        )
+        # Phase-0 fix: read the per-step cost directly from transition.extras.
+        # Previously we recomputed c(s) from state[:, :2], which — under the
+        # default exclude_current_positions_from_observation=True — was the
+        # slice [z, quat_w] (not torso xy).  d_wall therefore collapsed to 0
+        # inside the wall box at the origin, and c(s) ≡ σ((ε-0)/τ) = 0.8806.
+        # The env now computes c, d_wall, 1{d_wall<ε} from the authoritative
+        # pipeline_state.x.pos[0, :2] and emits them into state.info; the
+        # collector lifts them into transition.extras; flatten_crl_fn
+        # preserves them.  Here we just read them out.
+        cost           = transitions.extras["cost"]
+        d_wall         = transitions.extras["d_wall"]
+        hard_indicator = transitions.extras["hard_violation"]
 
         # Next-state action from current policy (plain sample, no entropy)
         next_obs = jnp.concatenate([next_state, goal], axis=1)
@@ -844,6 +922,17 @@ def main(args: Args):
         x_ts = means + stds * jax.random.normal(action_key, shape=means.shape)
         action = nn.tanh(x_ts)
 
+        # Safety-cost scalars at s_t (CURRENT state) — read BEFORE stepping.
+        # env_state.info["cost"] was populated by reset() (at t=0) or by the
+        # previous step() (for t>0), so it always refers to s_t.  This matches
+        # the Bellman target y = c(s_t) + γ_c · Q_c(s_{t+1}, a'), which is the
+        # convention the existing cost_critic_loss_fn uses.
+        _prev_info = env_state.info
+        _zeros = jnp.zeros(args.num_envs)
+        _cost  = _prev_info["cost"]           if "cost"           in _prev_info else _zeros
+        _dwall = _prev_info["d_wall"]         if "d_wall"         in _prev_info else _zeros
+        _hviol = _prev_info["hard_violation"] if "hard_violation" in _prev_info else _zeros
+
         next_env_state = env.step(env_state, action)
         _info = next_env_state.info
         # Our maze envs store `seed` directly in info; brax's EpisodeWrapper
@@ -868,6 +957,13 @@ def main(args: Args):
                 "next_state": next_env_state.obs[:, :args.obs_dim],   # s_{t+1} — needed
                                                                       # by cost_critic_loss_fn
                                                                       # Bellman backup
+                # Safety-cost scalars evaluated at s_{t+1} (i.e., the state
+                # reached by taking `action` in s_t).  cost_critic_loss_fn
+                # treats this as c(s_t, a_t, s_{t+1}) — the reward/cost
+                # returned by the env for the transition.
+                "cost":            _cost,
+                "d_wall":          _dwall,
+                "hard_violation":  _hviol,
             },
         )
         return (next_env_state, actor_params, key), transition
@@ -975,6 +1071,14 @@ def main(args: Args):
         _info = next_env_state.info
         _seed  = _info["seed"]       if "seed"       in _info else jnp.zeros(args.num_envs)
         _trunc = _info["truncation"] if "truncation" in _info else jnp.zeros(args.num_envs)
+        # Phase-0 safety-cost scalars — must be present here so the prefill
+        # transitions share the same pytree structure as collect_step's (the
+        # replay buffer's JAX arrays are keyed by tree structure, so mismatch
+        # would crash at first sample).
+        _zeros = jnp.zeros(args.num_envs)
+        _cost  = _info["cost"]           if "cost"           in _info else _zeros
+        _dwall = _info["d_wall"]         if "d_wall"         in _info else _zeros
+        _hviol = _info["hard_violation"] if "hard_violation" in _info else _zeros
         t = Transition(
             observation=env_state.obs,
             action=action,
@@ -987,6 +1091,9 @@ def main(args: Args):
                 },
                 "state":      env_state.obs[:, :args.obs_dim],       # s_t
                 "next_state": next_env_state.obs[:, :args.obs_dim],  # s_{t+1}
+                "cost":            _cost,
+                "d_wall":          _dwall,
+                "hard_violation":  _hviol,
             },
         )
         t1 = jax.tree_util.tree_map(lambda x: x[None], t)  # add unroll dim=1
@@ -998,8 +1105,14 @@ def main(args: Args):
     print(f"Buffer prefilled with ~{prefill_steps * args.num_envs} transitions.")
     print(f"Starting {args.num_epochs} epochs.  Constraints: {args.use_constraints}")
     if args.use_constraints:
-        print(f"  budget={args.cost_budget_d}  ε={args.cost_epsilon}  τ={args.cost_tau}"
-              f"  PID=({args.pid_kp},{args.pid_ki},{args.pid_kd})")
+        if args.cost_type == "quadratic":
+            print(f"  cost_type=quadratic  budget={args.cost_budget_d}  "
+                  f"ε_train={args.cost_epsilon}  ε_hard={args.cost_epsilon_hard}  "
+                  f"PID=({args.pid_kp},{args.pid_ki},{args.pid_kd})")
+        else:
+            print(f"  cost_type=sigmoid  budget={args.cost_budget_d}  "
+                  f"ε={args.cost_epsilon}  τ={args.cost_tau}  "
+                  f"PID=({args.pid_kp},{args.pid_ki},{args.pid_kd})")
 
     # ──────────────────────────────────────────────────────────
     #  Main training loop

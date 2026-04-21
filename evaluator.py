@@ -122,26 +122,42 @@ class CrlEvaluator():
             )
 
         # ── Eval-time constraint metrics ───────────────────────
-        # eval_data.observation: [episode_length, num_eval_envs, obs_size]
-        # First 2 dims of the state portion are the agent (x, y) position.
-        if self._cost_fn is not None and self._obs_dim is not None:
-            obs_np = np.array(eval_data.observation)          # [T, N, obs_size]
-            xy_flat = obs_np[:, :, :2].reshape(-1, 2)         # [T*N, 2]
-            xy_jax = jnp.array(xy_flat)
+        # PHASE-0 FIX: previously we reconstructed cost from
+        # `obs_np[:, :, :2]`, which is [z, quat_w] (not (x, y)) under
+        # `exclude_current_positions_from_observation=True`.  That produced
+        # a constant eval/mean_hard_cost identical to the broken training
+        # signal.  We now pull the authoritative per-step scalars straight
+        # from `eval_metrics.episode_metrics`, which are sums over each
+        # episode of the scalars the env wrote into `state.metrics`
+        # (computed from `pipeline_state.x.pos[0, :2]`).
+        if self._cost_fn is not None:
+            ep_steps = np.asarray(eval_metrics.episode_steps)        # [num_eval_envs]
+            # Avoid divide-by-zero on pathological envs that never stepped.
+            ep_steps_safe = np.maximum(ep_steps, 1.0)
 
-            # Hard indicator cost (interpretable)
-            hard_costs = np.array(self._cost_fn(xy_jax))      # [T*N]
-            mean_hard_cost = float(np.mean(hard_costs))
-            constraint_violation = float(
-                max(0.0, mean_hard_cost - self._cost_budget_d)
-            )
-            metrics["eval/mean_hard_cost"]       = mean_hard_cost
-            metrics["eval/constraint_violation"] = constraint_violation
+            if "hard_violation" in eval_metrics.episode_metrics:
+                # Per-episode mean hard-violation rate = (sum over steps) / steps.
+                hv_sum_per_ep = np.asarray(
+                    eval_metrics.episode_metrics["hard_violation"])  # [num_eval_envs]
+                hv_rate_per_ep = hv_sum_per_ep / ep_steps_safe
+                mean_hard_cost = float(np.mean(hv_rate_per_ep))
+                constraint_violation = float(
+                    max(0.0, mean_hard_cost - self._cost_budget_d)
+                ) if self._cost_budget_d is not None else 0.0
+                metrics["eval/mean_hard_cost"]       = mean_hard_cost
+                metrics["eval/constraint_violation"] = constraint_violation
 
-            # Smooth cost (for calibration comparison with training cost)
-            if self._smooth_cost_fn is not None:
-                smooth_costs = np.array(self._smooth_cost_fn(xy_jax))
-                metrics["eval/mean_smooth_cost"] = float(np.mean(smooth_costs))
+            if "cost" in eval_metrics.episode_metrics:
+                cost_sum_per_ep = np.asarray(
+                    eval_metrics.episode_metrics["cost"])            # [num_eval_envs]
+                cost_rate_per_ep = cost_sum_per_ep / ep_steps_safe
+                metrics["eval/mean_smooth_cost"] = float(np.mean(cost_rate_per_ep))
+
+            if "d_wall" in eval_metrics.episode_metrics:
+                dwall_sum_per_ep = np.asarray(
+                    eval_metrics.episode_metrics["d_wall"])
+                dwall_rate_per_ep = dwall_sum_per_ep / ep_steps_safe
+                metrics["eval/mean_d_wall"] = float(np.mean(dwall_rate_per_ep))
 
         metrics["eval/avg_episode_length"] = np.mean(eval_metrics.episode_steps)
         metrics["eval/epoch_eval_time"] = epoch_eval_time

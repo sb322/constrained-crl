@@ -44,15 +44,39 @@ echo "Using PYTHON=$PYTHON  (cwd=$(pwd))"
 
 # ── LD_LIBRARY_PATH: pip-installed nvidia libs first, then system CUDA ──
 PY_SITE=$("$PYTHON" - <<'PY'
-import site; print(site.getsitepackages()[0])
+import site
+# Print ALL site-package dirs (getsitepackages may return a dir that isn't the one
+# with nvidia libs in some venvs).
+for p in site.getsitepackages():
+    print(p)
 PY
 )
 
 PIP_NVIDIA_LIBS=""
-for subpkg in cudnn cusolver cublas cuda_runtime cuda_nvrtc cufft cuda_cupti cusparse; do
-    d="$PY_SITE/nvidia/$subpkg/lib"
-    [ -d "$d" ] && PIP_NVIDIA_LIBS="${PIP_NVIDIA_LIBS:+$PIP_NVIDIA_LIBS:}$d"
+for SITE in $PY_SITE; do
+    for subpkg in cudnn cusolver cublas cuda_runtime cuda_nvrtc cufft cuda_cupti cusparse nccl; do
+        d="$SITE/nvidia/$subpkg/lib"
+        [ -d "$d" ] && PIP_NVIDIA_LIBS="${PIP_NVIDIA_LIBS:+$PIP_NVIDIA_LIBS:}$d"
+    done
 done
+
+# Fallback: if canonical layout missed it, locate libcusolver.so anywhere under the venv.
+if ! echo "$PIP_NVIDIA_LIBS" | grep -q cusolver; then
+    echo "[warn] canonical nvidia/*/lib layout not found — falling back to find()"
+    FOUND=$(find "$VENV" -name 'libcusolver.so*' -not -path '*/torch/*' 2>/dev/null | head -1)
+    if [ -n "$FOUND" ]; then
+        EXTRA=$(dirname "$FOUND")
+        PIP_NVIDIA_LIBS="${PIP_NVIDIA_LIBS:+$PIP_NVIDIA_LIBS:}$EXTRA"
+        # Also add sibling nvidia libs if they're all in the same tree.
+        NVIDIA_ROOT=$(echo "$EXTRA" | sed 's|/nvidia/.*||')/nvidia
+        if [ -d "$NVIDIA_ROOT" ]; then
+            for sub in "$NVIDIA_ROOT"/*/lib; do
+                [ -d "$sub" ] && PIP_NVIDIA_LIBS="${PIP_NVIDIA_LIBS}:$sub"
+            done
+        fi
+    fi
+fi
+
 SYS_CUDA_LIB="/apps/easybuild/el9_5.x86_64/software/CUDA/12.8.0/lib64"
 export LD_LIBRARY_PATH="${PIP_NVIDIA_LIBS}:${SYS_CUDA_LIB}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
@@ -64,6 +88,42 @@ echo "===== ENVIRONMENT ====="
 echo "HOST=$(hostname)"
 nvidia-smi | head -20
 
+echo ""
+echo "===== PIP NVIDIA PACKAGES ====="
+"$PYTHON" -m pip list 2>/dev/null | grep -i -E '^(nvidia|jax|jaxlib)' || echo "  (none found)"
+
+echo ""
+echo "===== LD_LIBRARY_PATH ====="
+echo "$LD_LIBRARY_PATH" | tr ':' '\n'
+
+echo ""
+echo "===== cuSOLVER LOAD CHECK ====="
+"$PYTHON" - <<'PYCHECK_LIB'
+import ctypes, os, sys
+paths = os.environ.get('LD_LIBRARY_PATH', '').split(':')
+loaded = False
+for p in paths:
+    for name in ('libcusolver.so.11', 'libcusolver.so'):
+        lib = os.path.join(p, name)
+        if os.path.exists(lib):
+            print(f"  found: {lib}")
+            try:
+                ctypes.CDLL(lib)
+                print(f"  loaded OK: {lib}")
+                loaded = True
+                break
+            except Exception as e:
+                print(f"  load FAILED: {e}")
+    if loaded:
+        break
+if not loaded:
+    print("  FATAL: libcusolver.so could not be loaded from any LD_LIBRARY_PATH entry.")
+    sys.exit(1)
+PYCHECK_LIB
+if [ $? -ne 0 ]; then echo "cuSOLVER preflight failed — JAX will not see the GPU."; exit 1; fi
+
+echo ""
+echo "===== JAX GPU CHECK ====="
 "$PYTHON" - <<'PYCHECK'
 import jax
 print("jax.devices()     =", jax.devices())

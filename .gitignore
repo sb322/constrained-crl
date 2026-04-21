@@ -33,3 +33,9 @@ logs/
 # uv
 .python-version
 uv.lock
+
+# Build artifacts (figures, generated docs)
+*.png
+*.pdf
+*.docx
+first_results.tex

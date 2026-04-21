@@ -10,6 +10,13 @@ from jax import numpy as jp
 import mujoco
 import xml.etree.ElementTree as ET
 
+# Phase-0 patch (2026-04-20): env now emits safety cost in state.info so the
+# training loop no longer has to reach into the observation's first two dims
+# (which were [z, quat_w] — NOT torso xy — under the default
+# exclude_current_positions_from_observation=True). The authoritative torso
+# position comes from pipeline_state.x.pos[0, :2].
+from cost_utils import smooth_sigmoid_cost, compact_quadratic_cost
+
 
 RESET = R = 'r'
 GOAL = G = 'g'
@@ -265,6 +272,10 @@ def make_maze(maze_layout_name, maze_size_scaling):
     tree = ET.parse(xml_path)
     worldbody = tree.find(".//worldbody")
 
+    # Collect wall centers while we build the XML so the safety-cost function
+    # sees EXACTLY the same geometry as the simulator (no drift between
+    # cost_utils._MAZE_REGISTRY and the XML).
+    wall_centers_list = []
     for i in range(len(maze_layout)):
         for j in range(len(maze_layout[0])):
             struct = maze_layout[i][j]
@@ -284,6 +295,8 @@ def make_maze(maze_layout_name, maze_size_scaling):
                     conaffinity="1",
                     rgba="0.7 0.5 0.3 1.0",
                 )
+                wall_centers_list.append([i * maze_size_scaling,
+                                          j * maze_size_scaling])
 
     torso = tree.find(".//numeric[@name='init_qpos']")
     data = torso.get("data")
@@ -291,7 +304,9 @@ def make_maze(maze_layout_name, maze_size_scaling):
 
     tree = tree.getroot()
     xml_string = ET.tostring(tree)
-    return xml_string, possible_goals
+    wall_centers = jp.asarray(wall_centers_list, dtype=jp.float32)  # [N, 2]
+    half_wall_size = 0.5 * maze_size_scaling
+    return xml_string, possible_goals, wall_centers, half_wall_size
 
 
 class AntMaze(PipelineEnv):
@@ -309,11 +324,53 @@ class AntMaze(PipelineEnv):
         backend="generalized",
         maze_layout_name="u_maze",
         maze_size_scaling=4.0,
+        # Safety-cost hyperparameters. enable_cost=True makes step() populate
+        # state.info with cost / d_wall / hard_violation scalars computed from
+        # the ant's torso position. Set enable_cost=False for the unconstrained
+        # baseline (keys still present but always zero, so the collector
+        # codepath is uniform).
+        #
+        # cost_type selects the training-cost shape:
+        #   - "quadratic" (default): c_train = (1 - d_wall/ε_train)²  on the
+        #       compact support d_wall ∈ [0, ε_train]; 0 elsewhere.  Hard
+        #       violation uses a *separate* threshold ε_hard (usually
+        #       ε_hard ≤ ε_train) so shaping is decoupled from accounting.
+        #       This is the default after the v2-overnight run 962826 showed
+        #       the sigmoid produces a flat cost field over the corridor
+        #       interior (σ(-33) ≈ 10⁻¹⁵ for d_wall=1.75, ε=0.1, τ=0.05),
+        #       pinning λ̃ ≡ 0 and making safety vacuous.
+        #   - "sigmoid":    legacy c_train = σ((ε - d_wall)/τ).  Kept for
+        #       ablation/back-compat; ignores cost_epsilon_hard.
+        enable_cost: bool = True,
+        cost_type: str = "quadratic",
+        cost_epsilon: float = 2.0,
+        cost_epsilon_hard: float = 0.1,
+        cost_tau: float = 0.05,
         **kwargs,
     ):
-        xml_string, possible_goals = make_maze(maze_layout_name, maze_size_scaling)
+        xml_string, possible_goals, wall_centers, half_wall_size = make_maze(
+            maze_layout_name, maze_size_scaling
+        )
         sys = mjcf.loads(xml_string)
         self.possible_goals = possible_goals
+
+        # Safety-cost config (stored as plain Python attrs so JIT picks them up
+        # as constants; wall_centers is a jax array bound at trace time).
+        self._enable_cost = enable_cost
+        if cost_type not in ("quadratic", "sigmoid"):
+            raise ValueError(
+                f"Unknown cost_type '{cost_type}'. "
+                "Expected one of: 'quadratic', 'sigmoid'."
+            )
+        self._cost_type = cost_type
+        # For quadratic: cost_epsilon is the *shaping* bandwidth ε_train
+        # (default 0.3).  For sigmoid legacy path: cost_epsilon is the hard
+        # threshold used inside the sigmoid argument (default 0.1 there).
+        self._cost_epsilon = cost_epsilon
+        self._cost_epsilon_hard = cost_epsilon_hard
+        self._cost_tau = cost_tau
+        self._wall_centers = wall_centers          # [N, 2] float32
+        self._half_wall_size = half_wall_size      # scalar
 
         n_frames = 5
 
@@ -375,6 +432,11 @@ class AntMaze(PipelineEnv):
         pipeline_state = self.pipeline_init(q, qd)
         obs = self._get_obs(pipeline_state)
 
+        # Safety-cost scalars at initial state.  Even when enable_cost=False we
+        # keep the keys in info so the collector pipeline has a uniform schema.
+        agent_xy = pipeline_state.x.pos[0, :2]
+        cost0, d_wall0, hard0 = self._compute_safety_cost(agent_xy)
+
         reward, done, zero = jp.zeros(3)
         metrics = {
             "reward_forward": zero,
@@ -389,12 +451,59 @@ class AntMaze(PipelineEnv):
             "forward_reward": zero,
             "dist": zero,
             "success": zero,
-            "success_easy": zero
+            "success_easy": zero,
+            # Safety-cost metrics (rollout-level aggregation is done by the
+            # training loop; these are per-step scalars).
+            "cost": cost0,
+            "d_wall": d_wall0,
+            "hard_violation": hard0,
         }
-        info = {"seed": 0}
+        info = {
+            "seed": 0,
+            "cost": cost0,
+            "d_wall": d_wall0,
+            "hard_violation": hard0,
+        }
         state = State(pipeline_state, obs, reward, done, metrics)
         state.info.update(info)
         return state
+
+    def _compute_safety_cost(self, agent_xy: jax.Array) -> Tuple[jax.Array, jax.Array, jax.Array]:
+        """Compute (cost, d_wall, hard_violation) at a single agent (x, y).
+
+        Dispatches on self._cost_type:
+          - "quadratic":  cost = (1 - d_wall/ε_train)²  on d_wall ≤ ε_train,
+                          hard = 1{d_wall < ε_hard}   (separate threshold).
+          - "sigmoid"  :  cost = σ((ε - d_wall)/τ),    hard = 1{d_wall < ε}.
+
+        When self._enable_cost is False, returns zeros for cost and
+        hard_violation but still returns a correct d_wall (useful for
+        diagnostics even in the unconstrained baseline).
+
+        Args:
+            agent_xy: shape [2] — ant torso (x, y) in maze frame.
+
+        Returns:
+            cost:           scalar training cost (disabled → 0).
+            d_wall:         scalar, L2 distance from torso to nearest wall surface.
+            hard_violation: scalar ∈ {0, 1} (disabled → 0).
+        """
+        if self._cost_type == "quadratic":
+            cost, d_wall, hard = compact_quadratic_cost(
+                agent_xy, self._wall_centers, self._half_wall_size,
+                cost_epsilon_train=self._cost_epsilon,
+                cost_epsilon_hard=self._cost_epsilon_hard,
+            )
+        else:  # "sigmoid" — legacy path, kept for ablation
+            cost, d_wall, hard = smooth_sigmoid_cost(
+                agent_xy, self._wall_centers, self._half_wall_size,
+                cost_epsilon=self._cost_epsilon,
+                cost_tau=self._cost_tau,
+            )
+        if not self._enable_cost:
+            cost = jp.zeros_like(cost)
+            hard = jp.zeros_like(hard)
+        return cost, d_wall, hard
 
     def step(self, state: State, action: jax.Array) -> State:
         """Run one timestep of the environment's dynamics."""
@@ -406,6 +515,18 @@ class AntMaze(PipelineEnv):
         else:
             seed = state.info["seed"]
         info = {"seed": seed}
+
+        # ── Phase-0 safety-cost wiring ───────────────────────────────────────
+        # Compute (cost, d_wall, hard_violation) from the authoritative torso
+        # position (pipeline_state.x.pos[0, :2]), NOT from the observation.
+        # Rationale: exclude_current_positions_from_observation=True strips
+        # (x, y) from obs, so obs[:, :2] is [z, quat_w] — wrong two dims.
+        # This caused a flat cost signal (σ(2)=0.8806) across all v1/v2 runs.
+        agent_xy = pipeline_state.x.pos[0, :2]
+        cost, d_wall, hard_violation = self._compute_safety_cost(agent_xy)
+        info["cost"] = cost
+        info["d_wall"] = d_wall
+        info["hard_violation"] = hard_violation
 
         velocity = (pipeline_state.x.pos[0] - pipeline_state0.x.pos[0]) / self.dt
 
@@ -445,7 +566,12 @@ class AntMaze(PipelineEnv):
             forward_reward=forward_reward,
             dist=dist,
             success=success,
-            success_easy=success_easy
+            success_easy=success_easy,
+            # Safety-cost per-step scalars (flat, not averaged — the training
+            # loop is responsible for mean/hist aggregation over batches).
+            cost=cost,
+            d_wall=d_wall,
+            hard_violation=hard_violation,
         )
         state.info.update(info)
         return state.replace(

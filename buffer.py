@@ -215,6 +215,25 @@ class TrajectoryUniformSamplingQueue():
             "future_action": future_action,
         }
 
+        # Phase-0 safety-cost passthrough.  The collector stores per-step
+        # scalars (cost, d_wall, hard_violation) computed by the env from the
+        # authoritative torso xy (pipeline_state.x.pos[0, :2]).  These must
+        # survive flatten_crl_fn so cost_critic_loss_fn can read them directly
+        # instead of recomputing c(s) from observation[:, :2] — which, with
+        # exclude_current_positions_from_observation=True, was actually
+        # reading [z, quat_w] and collapsing c(s) to the constant σ(2)=0.8806.
+        #
+        # We drop the last element (seq_len-1) to match the sliced state/
+        # next_state/reward tensors above.  The fields are optional: if the
+        # env was constructed with enable_cost=False they won't be present,
+        # so we check transition.extras first.
+        if "cost" in transition.extras:
+            extras["cost"] = jnp.squeeze(transition.extras["cost"][:-1])
+        if "d_wall" in transition.extras:
+            extras["d_wall"] = jnp.squeeze(transition.extras["d_wall"][:-1])
+        if "hard_violation" in transition.extras:
+            extras["hard_violation"] = jnp.squeeze(transition.extras["hard_violation"][:-1])
+
         return transition._replace(
             observation=jnp.squeeze(new_obs),
             action=jnp.squeeze(transition.action[:-1]),
