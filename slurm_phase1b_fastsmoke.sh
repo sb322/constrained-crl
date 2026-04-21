@@ -44,7 +44,7 @@ WORKDIR="/mmfs1/home/sb3222/projects/constrained-crl"
 VENV="$WORKDIR/.venv"
 PYTHON="$VENV/bin/python"
 
-cd "$WORKDIR/constrained_crl" || exit 1
+cd "$WORKDIR" || exit 1
 
 export PATH="$VENV/bin:$PATH"
 
