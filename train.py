@@ -57,7 +57,7 @@ class Args:
     num_update_epochs: int = 4
     seed: int = 0
     batch_size: int = 256
-    normalize_observations: bool = False
+    normalize_observations: bool = True  # Option-A: restore JaxGCRL/scaling-crl default
     max_replay_size: int = 10_000
     min_replay_size: int = 8_192
     deterministic_eval: bool = True
@@ -117,7 +117,7 @@ class Args:
     # ν_f = log(N) where N = batch_size (InfoNCE normalization constant)
     # ν_c = 1/(1-γ) (cost-to-go scale)
     # These are computed from other args at init; set to 0 for auto.
-    nu_f: float = 0.0               # 0 = auto → log(batch_size)
+    nu_f: float = 1.0               # Option-A: no preconditioning shrinkage, match scaling-crl actor scale. 0 = auto → log(batch_size) (legacy)
     nu_c: float = 0.0               # 0 = auto → 1/(1-gamma)
     # Cost critic architecture
     cost_critic_lr: float = 3e-4
@@ -593,11 +593,11 @@ def main(args: Args):
         sa_repr = sa_encoder.apply(sa_enc_p, obs[:, :args.obs_dim], action)
         g_repr  = g_encoder.apply(g_enc_p, goal)
 
-        # NaN-safe L2 distance: sqrt(x) has NaN gradient at x=0 in JAX (0/0).
-        # +1e-12 is outside FP32 representable noise floor for the sqrt output
-        # but ensures the gradient path is finite even when two reprs collide.
-        _d2 = jnp.sum((sa_repr[:, None, :] - g_repr[None, :, :]) ** 2, axis=-1)
-        logits = -jnp.sqrt(_d2 + 1e-12)
+        # Option-A: dot-product (inner-product) energy — canonical Eysenbach-2022 /
+        # scaling-crl parameterization. LayerNorm inside the encoders anchors ‖φ‖,‖ψ‖,
+        # giving bounded ⟨φ,ψ⟩. This replaces the negative-L2 metric whose 1/‖φ−ψ‖
+        # gradient pathology on positive pairs was implicated in the rvsu555e collapse.
+        logits = jnp.einsum("ik,jk->ij", sa_repr, g_repr)
         logsumexp_val = jax.nn.logsumexp(logits, axis=1)
         loss = -jnp.mean(jnp.diag(logits) - logsumexp_val)
         loss += args.logsumexp_penalty_coeff * jnp.mean(logsumexp_val ** 2)
@@ -633,11 +633,12 @@ def main(args: Args):
         log_prob -= jnp.log((1 - jnp.square(action)) + 1e-6)
         log_prob = log_prob.sum(-1)
 
-        # Contrastive critic f(s,a,g) — this is the InfoNCE log-density ratio.
-        # Same NaN-safe sqrt as in critic_loss_fn: avoids NaN gradient at x=0.
+        # Contrastive critic f(s,a,g) — Option-A: dot-product energy, matching
+        # the critic_loss_fn energy above. ⟨φ(s,a), ψ(g)⟩ has uniformly bounded
+        # gradient ‖∂f/∂a‖ ≤ ‖∂φ/∂a‖·‖ψ‖, with both factors anchored by LayerNorm.
         sa_repr = sa_encoder.apply(critic_params["sa_encoder"], state, action)
         g_repr  = g_encoder.apply(critic_params["g_encoder"],  goal)
-        f_sa_g  = -jnp.sqrt(jnp.sum((sa_repr - g_repr) ** 2, axis=-1) + 1e-12)
+        f_sa_g  = jnp.sum(sa_repr * g_repr, axis=-1)
 
         alpha = jnp.exp(log_alpha)
         # Preconditioned: divide f by ν_f to normalize InfoNCE scale
