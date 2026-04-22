@@ -251,8 +251,18 @@ def load_from_wandb(project: str, entity: str | None, group: str,
         print(f"No runs found in {path!r} with filters={filters}.",
               file=sys.stderr)
         sys.exit(2)
-    # Pick the most recently updated run in the group.
-    run = sorted(runs, key=lambda r: r.updated_at, reverse=True)[0]
+    # Pick the most recently updated run in the group.  Different wandb
+    # versions expose the timestamp under different names; try the known
+    # ones in order, fall back to "first in list" (wandb returns sorted).
+    def _run_ts(r):
+        for attr in ("updated_at", "heartbeatAt", "createdAt", "_attrs"):
+            v = getattr(r, attr, None)
+            if isinstance(v, str):
+                return v
+            if isinstance(v, dict) and "updatedAt" in v:
+                return v["updatedAt"]
+        return ""
+    run = sorted(runs, key=_run_ts, reverse=True)[0]
     # Use bulk history() not scan_history() — one HTTPS call vs T round-trips.
     try:
         df = run.history(keys=["j_c_hat", "epoch"], samples=10_000, pandas=True)
