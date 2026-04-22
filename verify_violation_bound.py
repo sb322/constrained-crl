@@ -253,12 +253,21 @@ def load_from_wandb(project: str, entity: str | None, group: str,
         sys.exit(2)
     # Pick the most recently updated run in the group.
     run = sorted(runs, key=lambda r: r.updated_at, reverse=True)[0]
-    rows: list[float] = []
-    for row in run.scan_history(keys=["j_c_hat", "epoch"]):
-        v = row.get("j_c_hat")
-        if v is not None:
-            rows.append(float(v))
-    return run.name, np.asarray(rows, dtype=np.float64)
+    # Use bulk history() not scan_history() — one HTTPS call vs T round-trips.
+    try:
+        df = run.history(keys=["j_c_hat", "epoch"], samples=10_000, pandas=True)
+        if "j_c_hat" in df.columns:
+            arr = df["j_c_hat"].dropna().to_numpy(dtype=np.float64)
+        else:
+            arr = np.asarray([], dtype=np.float64)
+    except Exception:
+        rows: list[float] = []
+        for row in run.scan_history(keys=["j_c_hat", "epoch"]):
+            v = row.get("j_c_hat")
+            if v is not None:
+                rows.append(float(v))
+        arr = np.asarray(rows, dtype=np.float64)
+    return run.name, arr
 
 
 def load_from_json(path: str) -> tuple[str, np.ndarray]:
