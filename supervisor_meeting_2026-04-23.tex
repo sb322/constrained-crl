@@ -1,0 +1,392 @@
+% !TEX TS-program = pdflatex
+% !TEX encoding   = UTF-8 Unicode
+%
+% Progress memo — Constrained goal-conditioned contrastive RL (post Phase-1d final)
+% Overleaf usage:
+%   1) New Project -> Blank Project
+%   2) Paste this file as main.tex
+%   3) Upload phase1b_story.png, phase1d_final.png, depth_ablation.png
+%      (optionally also phase1d_midrun.png if you want to show the mid-run snapshot)
+%   4) Recompile with pdfLaTeX.
+%
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{siunitx}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{graphicx}
+\usepackage{float}
+\usepackage{listings}
+\usepackage[colorlinks=true,linkcolor=blue!50!black,urlcolor=blue!50!black,citecolor=blue!50!black]{hyperref}
+\usepackage{titlesec}
+\titleformat{\section}{\normalfont\large\bfseries}{\thesection.}{0.6em}{}
+\titleformat{\subsection}{\normalfont\bfseries}{\thesubsection.}{0.5em}{}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  keywordstyle=\color{blue!60!black},
+  commentstyle=\color{gray},
+  columns=fullflexible,
+  breaklines=true,
+  showstringspaces=false,
+  frame=single,
+  framesep=4pt,
+  framerule=0.3pt,
+  aboveskip=0.5em,
+  belowskip=0.5em,
+}
+
+% Shorthand
+\newcommand{\Jr}{J_{r}}
+\newcommand{\Jc}{J_{c}}
+\newcommand{\Jhatc}{\widehat{J}_{c}}
+\newcommand{\Qc}{Q_{c}}
+\newcommand{\QCRL}{Q_{\mathrm{CRL}}}
+\newcommand{\lamt}{\tilde{\lambda}}
+\newcommand{\eps}{\varepsilon}
+\newcommand{\Ltext}[1]{\mathcal{L}_{\text{#1}}}
+
+\title{\vspace{-2em}%
+Progress update\,---\,Constrained goal-conditioned contrastive RL\\
+\large SR-CPO on Brax MJX ant mazes: depth\,$\times$\,feasibility}
+\author{Siamak Beikzadeh}
+\date{2026-04-23\quad (post Phase-1d final)}
+
+\begin{document}
+\maketitle
+\vspace{-1.5em}
+
+%-------------------------------------------------------------------------------
+\section{One-paragraph framing (for anyone in the room)}
+\label{sec:framing}
+
+We train an ant to reach goals in a maze while staying away from walls. The
+reward side of the objective is handled by a \emph{contrastive reward
+critic} (InfoNCE; it learns how compatible a state\,--\,action is with a goal).
+The safety side is a separate \emph{cost critic} that predicts how much
+wall-proximity cost a policy will accumulate. A \emph{Lagrange multiplier}
+$\lambda\ge 0$ penalizes cost-budget violation and is updated online by a
+PID controller. The scientific question of the project is: \textbf{when does
+network depth help feasibility in this constrained problem?} Before we can
+answer that, the underlying contrastive learner has to be stable. This memo
+reports the two diagnostic runs and their joint result: our first attempted
+fix (``Option-A'') did \emph{not} stabilize the actor; we have a specific
+diagnosis and a one-line fix for a follow-up run.
+
+%-------------------------------------------------------------------------------
+\section{Notation and parameters (glossary)}
+\label{sec:glossary}
+
+\begin{center}
+\small
+\renewcommand{\arraystretch}{1.15}
+\begin{tabular}{@{}l l p{9.2cm}@{}}
+\toprule
+Symbol & Value / role & Plain meaning \\
+\midrule
+$s,a,g$              & state, action, goal             & Standard GCRL triple. $g$ is the desired goal. \\
+$\pi_\theta(a\mid s,g)$ & actor (policy)               & Parameterized stochastic policy (Gaussian head). \\
+$\Jr(\pi),\Jc(\pi)$  & reward/cost returns             & Expected discounted reward and cost under $\pi$. \\
+$\Jhatc$             & estimated cost return           & Cost critic's current estimate of $\Jc(\pi)$. \\
+$d=0.15$             & cost budget                     & Upper allowed value for $\Jc(\pi)$; constraint is $\Jc\le d$. \\
+$\lambda\ge 0$       & Lagrange multiplier             & Price of budget violation. Learned, not fixed. \\
+$\lamt$              & normalized $\lambda$            & Same object, rescaled for logging readability. \\
+$\lambda_{\max}=100$ & clip on $\lambda$               & Dual variable cannot exceed this. \\
+$K_p,K_i,K_d$        & $(0.1,\,0.003,\,0.001)$         & PID gains (Stooke et al.\ 2020) moving $\lambda$ online. \\
+$\QCRL,\Qc$          & reward/cost critics             & Reward side is InfoNCE; cost side is one-step TD. \\
+$\varphi(s,a),\psi(g)$ & state-action and goal encoders& 4-block Wang residual MLPs; their inner product is the InfoNCE score. \\
+$\alpha$             & entropy coefficient             & Weight on $\log\pi$. \\
+$\nu_f$              & actor preconditioning           & Scalar dividing the reward-critic term in the actor loss. \\
+$\nu_c=1/(1-\gamma)$ & cost preconditioning            & Achiam-CPO scaling. \\
+$c(s)$               & per-step cost                   & $c(s)=(1-d_{\text{wall}}/\eps_{\text{train}})^2$, clipped to $[0,1]$. \\
+$\eps_{\text{train}}=2.0,\;\eps_{\text{hard}}=0.1$ & cost supports & Soft-cost support; hard-violation indicator (logging only). \\
+depth $=4$, env $=$ ant\_big\_maze & setup            & 4 residual blocks; Brax MJX; 256 parallel envs. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent\textbf{Constrained objective and Lagrangian.}
+\begin{equation}
+\max_{\pi}\ \Jr(\pi)\qquad \text{s.t.}\qquad \Jc(\pi)\le d,
+\qquad
+L(\theta,\lambda)\,=\,\Jr(\pi_\theta)-\lambda\bigl(\Jc(\pi_\theta)-d\bigr).
+\label{eq:cmdp}
+\end{equation}
+\begin{equation}
+\Ltext{actor}(\theta)
+\;=\;-\,\QCRL(s,a,g)/\nu_f\;+\;\lambda\,\Qc(s,a)/\nu_c\;+\;\alpha\,\log\pi(a\mid s,g).
+\label{eq:actor-loss}
+\end{equation}
+The dual is updated by a PID controller on $e_k=\Jhatc-d$ with anti-windup
+and clipping to $[0,\lambda_{\max}]$. The reward critic is trained by
+InfoNCE, the cost critic by one-step TD on $c(s)$.
+
+%-------------------------------------------------------------------------------
+\section{What is broken --- and what our first fix attempt did not fix}
+\label{sec:issues}
+
+\paragraph{Observation A --- the constraint is strictly feasible.}
+At $d=0.15$, $\Jhatc\approx 0.02$ and the hard violation rate is $0$. The
+policy is far from the budget. PID control correctly drives $\lamt\to 0$
+and keeps it there.
+
+\paragraph{Observation B --- the actor loss diverges to $\mathcal{O}(-10^{5})$.}
+Simultaneously, the reward side of \eqref{eq:actor-loss} explodes. Not a
+gradient-clipping artifact; the logged actor loss itself is driven downward
+by a growing $\QCRL(s,a,g)$.
+
+\paragraph{Mechanism.}
+With $\lamt=0$, \eqref{eq:actor-loss} collapses to
+$-\QCRL/\nu_f + \alpha\log\pi$. Any energy that is unbounded above in the
+representation norms $\|\varphi\|,\|\psi\|$ lets the actor minimize the
+surrogate by scaling up the encoder outputs. Nothing in the objective
+penalizes representation magnitude when $\lamt=0$. \textbf{Whatever energy
+is used, it must be norm-bounded.}
+
+\subsection*{Option-A as we shipped it}
+
+Phase-1d swapped three knobs to match the scaling-CRL reference
+(Wang et al.\ 2025; JaxGCRL):
+\begin{enumerate}[leftmargin=1.6em,itemsep=1pt,topsep=1pt]
+\item Energy $-\|\varphi-\psi\|_2\;\to\;\langle\varphi,\psi\rangle$.
+\item \texttt{normalize\_observations}: \texttt{False}$\;\to\;$\texttt{True}.
+\item $\nu_f$: $\log N\approx 5.5\;\to\;1.0$.
+\end{enumerate}
+The shipping code comment on line 597 of \texttt{train.py} claimed this
+was sufficient:
+\begin{quote}
+\small ``Option-A: dot-product (inner-product) energy --- \ldots LayerNorm
+inside the encoders anchors $\|\varphi\|,\|\psi\|$, giving bounded
+$\langle\varphi,\psi\rangle$.''
+\end{quote}
+\textbf{That claim is false.} LayerNorm normalizes hidden activations
+\emph{inside} each residual block along the feature axis, per-sample; it
+does not bound the final encoder output. A trailing Dense layer can
+rescale the output by an arbitrary factor, so $\|\varphi\|,\|\psi\|$ are
+unconstrained and $\langle\varphi,\psi\rangle$ is still unbounded above.
+Option-A closed the \emph{functional form} of the energy (from negative-L2
+to inner product) but left the \emph{norm escape route} wide open.
+
+\subsection*{What scaling-CRL actually does}
+
+Wang 2025 and JaxGCRL explicitly row-$L_2$ normalize the final $\varphi,\psi$
+before the inner product, typically with a temperature $\tau$:
+
+\begin{lstlisting}[language=Python]
+sa_repr = sa_repr / jnp.linalg.norm(sa_repr, axis=-1, keepdims=True)
+g_repr  = g_repr  / jnp.linalg.norm(g_repr,  axis=-1, keepdims=True)
+logits  = jnp.einsum("ik,jk->ij", sa_repr, g_repr) / tau
+\end{lstlisting}
+
+\noindent
+Cosine similarity lives in $[-1,1]$, which is genuinely norm-bounded. Our
+\texttt{train.py} lines 600 and 641 skip this step --- the inner product is
+raw, not cosine.
+
+%-------------------------------------------------------------------------------
+\section{Canonical setup (unchanged this sprint)}
+\label{sec:setup}
+
+Encoders $\varphi,\psi$ each stack four Wang~2025 residual blocks
+(Dense $\to$ LayerNorm $\to$ Swish, with skip). Cost is the compact-support
+quadratic $c(s)=(1-d_{\text{wall}}/\eps_{\text{train}})^2$. Budget $d=0.15$,
+depth $4$, seed $0$ for Runs 2--3.
+
+%-------------------------------------------------------------------------------
+\section{Run 1 --- depth ablation (prior work, for context)}
+\label{sec:run1}
+
+Depths $\{2,4,8,16\}\times$ two seeds, 20M-step target. At the original
+$d=0.1$ with the sigmoid cost, the constraint never activated, which made
+the depth axis uninformative. Motivated the switch to the current
+compact-support quadratic $c(s)$.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.98\linewidth]{depth_ablation.png}
+\caption{Run 1 --- SR-CPO depth ablation on Ant Big Maze, budget $d=0.1$,
+PID $=(0.1,0.003,0.001)$, 20M-step target. Six panels: hard-violation rate,
+mean step cost, $\Jhatc$ vs.\ budget, $\lambda$, reward-critic (InfoNCE)
+loss, actor loss. Solid $=$ seed 0, dashed $=$ seed 42; color encodes
+depth. Takeaway: constraint never activates, so depth has nothing to act
+on.}
+\label{fig:run1}
+\end{figure}
+
+%-------------------------------------------------------------------------------
+\section{Run 2 --- Phase-1b (job 963416, 50/50 epochs)}
+\label{sec:run2}
+
+\begin{center}
+\small
+\begin{tabular}{@{}l r@{}}
+\toprule
+Metric & Final-epoch value \\
+\midrule
+\texttt{train/actor\_loss}           & $-4.86\times 10^{5}$ (diverging throughout) \\
+\texttt{train/critic\_loss} (InfoNCE) & $4.26$ \\
+$\lamt$                              & $0.0000$ (decayed within first few epochs) \\
+$\Jhatc$                             & $0.0189\approx 13\%$ of $d$ \\
+\texttt{train/hard\_violation\_rate} & $0.0000$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.98\linewidth]{phase1b_story.png}
+\caption{Run 2 (Phase-1b). Actor loss driven to $\approx -4.85\times 10^{5}$
+(top-left); InfoNCE loss well-behaved at $\approx 4.3$ (top-mid); $\lamt$
+decays to $0$ (top-right); $\Jhatc\approx 0.019\ll d=0.15$ (bottom-left);
+hard-violation $\approx 0$ (bottom-mid); mean step cost bounded (bottom-right).
+Reading: feasibility $\Rightarrow\lamt=0\Rightarrow$ unstabilized CRL
+$\Rightarrow$ actor blow-up.}
+\label{fig:run2}
+\end{figure}
+
+%-------------------------------------------------------------------------------
+\section{Run 3 --- Phase-1d Option-A (job 976587, 50/50 epochs FINAL)}
+\label{sec:run3}
+
+Identical config to Run 2 except the three Option-A knobs of
+Sec.~\ref{sec:issues}. Verified at shipped-code level (\texttt{train.py}
+lines 60, 120, 600, 641) before \texttt{sbatch}.
+
+\begin{center}
+\small
+\begin{tabular}{@{}l r r@{}}
+\toprule
+Metric & Phase-1d final & Phase-1b final \\
+\midrule
+\texttt{train/actor\_loss}           & $\mathbf{-4.67\times 10^{5}}$ (diverged) & $-4.86\times 10^{5}$ \\
+\texttt{train/critic\_loss}           & $4.25$       & $4.26$ \\
+$\lamt$                              & $0.0000$     & $0.0000$ \\
+$\Jhatc$                             & $0.0191$     & $0.0189$ \\
+\texttt{train/hard\_violation\_rate} & $0.0000$     & $0.0000$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent
+\textbf{Pass criterion failed.} $|\Ltext{actor}|<10^{3}$ held through
+epoch $\sim 28$; early-epoch dynamics were bounded and roughly geometric
+($\sim\!1.28\times$ per epoch); the bound was crossed around epoch 30 and
+the run terminated at a value essentially indistinguishable from Phase-1b.
+Run finished cleanly: \texttt{exit=0}, checkpoint saved, no NaN.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.98\linewidth]{phase1d_final.png}
+\caption{Run 3 (Phase-1d, final 50/50). Same six-panel layout as
+Fig.~\ref{fig:run2}. Actor loss (top-left) diverges to
+$\approx -4.67\times 10^{5}$, matching Phase-1b within 4\%. InfoNCE loss
+(top-mid) stable at $\approx 4.25$ --- the critic is not the problem.
+$\lamt$ (top-right) remains at $0$, $\Jhatc\approx 0.019$ (bottom-left),
+hard-violation $\approx 0$ (bottom-mid). Message: the three-knob Option-A
+bundle did not prevent the actor blow-up; it only delayed its takeoff.}
+\label{fig:run3}
+\end{figure}
+
+%-------------------------------------------------------------------------------
+\section{Interpretation --- withdrawing the earlier ``H1 leading'' call}
+\label{sec:interp}
+
+The 15-epoch mid-run peek showed $\Ltext{actor}=-142.58$, which read as
+``bounded with 3 orders of magnitude margin.'' That reading was wrong: the
+run was on the same geometric-growth curve as Phase-1b, just at an earlier
+point on it. At 50 epochs both runs converge to the same
+$\mathcal{O}(10^{5})$ magnitude.
+
+Option-A is \emph{incomplete}, not merely wrong: swapping the energy
+function is a necessary part of the scaling-CRL recipe, but by itself it
+does nothing when the final representations are still unbounded in norm.
+
+\paragraph{Revised hypothesis state.}
+\begin{description}[leftmargin=2.4em,style=nextline,itemsep=2pt,topsep=1pt]
+\item[H1 as specified (three-knob bundle).] \textbf{Rejected.} Option-A did
+not stabilize the actor at $\lambda=0$.
+\item[H1$'$ (implementation-driven, but requires ALSO row-$L_2$ normalization
+$+$ temperature).] Open, testable in one single-knob run.
+\item[H2 (intrinsic at $\lambda=0$).] Still consistent with the data, not
+yet distinguishable from H1$'$.
+\end{description}
+
+Phase-1f (below) distinguishes H1$'$ from H2 in a single run.
+
+%-------------------------------------------------------------------------------
+\section{Next steps (revised)}
+\label{sec:next}
+
+\begin{enumerate}[leftmargin=1.6em,itemsep=3pt,topsep=1pt]
+\item \textbf{Phase-1f --- row-$L_2$ normalization $+$ temperature
+$\tau=1/\sqrt{D}$ on $\varphi,\psi$ outputs.}
+Single-knob change on top of current Option-A. Modifies two lines near
+\texttt{train.py:594} (critic\_loss\_fn) and two lines near
+\texttt{train.py:640} (actor\_loss\_fn). Preflight assertion:
+$\|\varphi\|=\|\psi\|=1$ on a sample batch. Same SLURM template as
+Phase-1d; $d=0.15$, depth 4, seed 0, 5M steps, 50 epochs.
+\begin{itemize}[leftmargin=1.4em,itemsep=1pt,topsep=2pt]
+\item If $|\Ltext{actor}|<10^{3}$ holds to epoch~50: H1$'$ wins --- Option-A
+was incomplete, not wrong; resume the depth-feasibility program.
+\item If $|\Ltext{actor}|$ still diverges: H2 wins --- constraints are a
+necessary CRL stabilizer; this becomes the paper
+(reframe around emergent-Lagrangian regularization).
+\end{itemize}
+\item \textbf{Phase-1e tight-budget $d=0.05$.}
+Hold until Phase-1f is in. If H2 is the answer, Phase-1e automatically
+tests it by forcing $\lamt>0$. If H1$'$ wins, run Phase-1e on the fixed
+code.
+\item \textbf{Depth sweep.}
+Held until the stabilization question is closed either way. Running it on
+unstable code would answer the wrong question.
+\end{enumerate}
+
+\noindent\emph{One change at a time; no bundling with unrelated cleanups.}
+
+%-------------------------------------------------------------------------------
+\section*{What to say in the meeting (three sentences)}
+
+\begin{enumerate}[leftmargin=1.6em,itemsep=3pt,topsep=1pt]
+\item Phase-1d finished 50 epochs cleanly but the pass criterion failed:
+actor diverged to $-4.67\times 10^{5}$, essentially matching Phase-1b's
+$-4.86\times 10^{5}$, so the three-knob Option-A bundle did \textbf{not}
+stabilize the actor at $\lambda=0$.
+\item Root cause: the shipped code's comment is wrong --- internal LayerNorm
+does not bound the final encoder outputs $\varphi,\psi$, so the inner
+product is still unbounded, and the actor escaped Option-A the same way
+it escaped the negative-$L_2$ energy; the missing piece is
+\textbf{row-$L_2$ normalization $+$ temperature on the final
+representations}, which is the explicit step in Wang 2025 that we skipped.
+\item Plan is a single-knob Phase-1f that adds exactly that normalization;
+if it stabilizes the actor we're back on the depth-feasibility program,
+if it doesn't then constraints really are a necessary CRL stabilizer
+(H2) and that becomes the paper --- either way the answer is one run
+away.
+\end{enumerate}
+
+%-------------------------------------------------------------------------------
+\section*{Artifacts}
+
+\begin{itemize}[leftmargin=1.4em,itemsep=1pt,topsep=1pt]
+\item \texttt{phase1b\_story.png/csv}\,---\,Run 2 (50 epochs).
+\item \texttt{phase1d\_final.png/csv}\,---\,Run 3 (50 epochs, final).
+\item \texttt{phase1d\_midrun.png/csv}\,---\,Run 3 (15-epoch mid-run;
+kept for the record, do not cite as evidence).
+\item \texttt{depth\_ablation.png}\,---\,Run 1.
+\item \texttt{plot\_phase1b.py}\,---\,single-run plotter.
+\item \texttt{crl\_formulation\_verification.md}\,---\,Wang 2025 formulation
+audit.
+\item \texttt{slurm\_phase1d\_option\_a.sh}\,---\,finished SLURM; preflight
+asserted the three Option-A knobs but did not check for row-$L_2$
+normalization (missing preflight for Phase-1f).
+\end{itemize}
+
+\end{document}

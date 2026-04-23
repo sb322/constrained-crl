@@ -119,6 +119,11 @@ class Args:
     # These are computed from other args at init; set to 0 for auto.
     nu_f: float = 1.0               # Option-A: no preconditioning shrinkage, match scaling-crl actor scale. 0 = auto → log(batch_size) (legacy)
     nu_c: float = 0.0               # 0 = auto → 1/(1-gamma)
+    # Phase-1f: temperature for cosine InfoNCE logits ⟨φ̂, ψ̂⟩ / τ.
+    # τ = 1.0 → pure cosine similarity ∈ [−1, 1].
+    # Drop τ to 0.5 or 0.1 ONLY if InfoNCE loss plateaus at log(batch_size) and
+    # acc stays at 1/N — that is a τ-tuning branch, not a new hypothesis.
+    tau: float = 1.0
     # Cost critic architecture
     cost_critic_lr: float = 3e-4
     cost_critic_width: int = 256
@@ -593,11 +598,20 @@ def main(args: Args):
         sa_repr = sa_encoder.apply(sa_enc_p, obs[:, :args.obs_dim], action)
         g_repr  = g_encoder.apply(g_enc_p, goal)
 
-        # Option-A: dot-product (inner-product) energy — canonical Eysenbach-2022 /
-        # scaling-crl parameterization. LayerNorm inside the encoders anchors ‖φ‖,‖ψ‖,
-        # giving bounded ⟨φ,ψ⟩. This replaces the negative-L2 metric whose 1/‖φ−ψ‖
-        # gradient pathology on positive pairs was implicated in the rvsu555e collapse.
-        logits = jnp.einsum("ik,jk->ij", sa_repr, g_repr)
+        # Phase-1f: cosine-InfoNCE energy. Row-L2 normalize φ, ψ so
+        #   ⟨φ̂, ψ̂⟩  =  cos(φ, ψ)  ∈  [−1, 1],
+        # making the critic score genuinely norm-bounded. The Phase-1d Option-A
+        # comment here used to claim that LayerNorm *inside* the residual blocks
+        # anchored ‖φ‖, ‖ψ‖; it does not (LayerNorm normalizes hidden activations
+        # per-sample, not the final encoder output — trailing Dense layers can
+        # rescale arbitrarily). Without explicit row-L2 normalization, ⟨φ, ψ⟩ is
+        # unbounded above, and the actor escapes by growing ‖φ‖‖ψ‖, which is
+        # what destroyed Phase-1b (|a_loss| → −4.86e5) AND Phase-1d Option-A
+        # (|a_loss| → −4.67e5) at λ̃ = 0. Dividing by args.tau controls the
+        # softmax temperature for the InfoNCE log-likelihood.
+        sa_repr = sa_repr / (jnp.linalg.norm(sa_repr, axis=-1, keepdims=True) + 1e-8)
+        g_repr  = g_repr  / (jnp.linalg.norm(g_repr,  axis=-1, keepdims=True) + 1e-8)
+        logits = jnp.einsum("ik,jk->ij", sa_repr, g_repr) / args.tau
         logsumexp_val = jax.nn.logsumexp(logits, axis=1)
         loss = -jnp.mean(jnp.diag(logits) - logsumexp_val)
         loss += args.logsumexp_penalty_coeff * jnp.mean(logsumexp_val ** 2)
@@ -633,12 +647,15 @@ def main(args: Args):
         log_prob -= jnp.log((1 - jnp.square(action)) + 1e-6)
         log_prob = log_prob.sum(-1)
 
-        # Contrastive critic f(s,a,g) — Option-A: dot-product energy, matching
-        # the critic_loss_fn energy above. ⟨φ(s,a), ψ(g)⟩ has uniformly bounded
-        # gradient ‖∂f/∂a‖ ≤ ‖∂φ/∂a‖·‖ψ‖, with both factors anchored by LayerNorm.
+        # Phase-1f: cosine-InfoNCE energy, matching critic_loss_fn. Row-L2
+        # normalize φ, ψ so f(s, a, g) = ⟨φ̂, ψ̂⟩ / τ ∈ [−1/τ, 1/τ]. This is the
+        # actual norm bound on the actor's reward-critic term, replacing the
+        # broken Phase-1d claim that LayerNorm alone bounded ‖φ‖, ‖ψ‖.
         sa_repr = sa_encoder.apply(critic_params["sa_encoder"], state, action)
         g_repr  = g_encoder.apply(critic_params["g_encoder"],  goal)
-        f_sa_g  = jnp.sum(sa_repr * g_repr, axis=-1)
+        sa_repr = sa_repr / (jnp.linalg.norm(sa_repr, axis=-1, keepdims=True) + 1e-8)
+        g_repr  = g_repr  / (jnp.linalg.norm(g_repr,  axis=-1, keepdims=True) + 1e-8)
+        f_sa_g  = jnp.sum(sa_repr * g_repr, axis=-1) / args.tau
 
         alpha = jnp.exp(log_alpha)
         # Preconditioned: divide f by ν_f to normalize InfoNCE scale
