@@ -1215,6 +1215,30 @@ def main(args: Args):
     (env_state, buffer_state, _), _ = jax.lax.scan(
         prefill_one, (env_state, buffer_state, prefill_key), (), length=prefill_steps)
     print(f"Buffer prefilled with ~{prefill_steps * args.num_envs} transitions.")
+
+    # Phase-1f NaN-forensics: post-prefill probe. Runs ONCE, before any
+    # training step. Distinguishes:
+    #   buffer NaN here          → env emit under random uniform action is the
+    #                              source. Fix is in env (MJX integrator) or
+    #                              prefill action sampler.
+    #   buffer clean, env NaN    → final prefill env_state was corrupted but
+    #                              buffer rows so far are OK; first post-prefill
+    #                              rollout will read NaN obs.
+    #   both clean               → NaN enters in first training step (gradient
+    #                              poisons actor params → next rollout emits
+    #                              NaN action → next buffer row contaminates).
+    _buf_data = buffer_state.data
+    _buf_step_nan = jnp.any(jnp.isnan(_buf_data), axis=tuple(range(1, _buf_data.ndim)))
+    _buf_any_nan  = bool(jnp.any(_buf_step_nan))
+    _buf_first_nan = int(jnp.argmax(_buf_step_nan.astype(jnp.int32))) if _buf_any_nan else -1
+    _env_obs_nan = bool(jnp.any(jnp.isnan(env_state.obs)))
+    print(f"[prefill probe] buffer.data shape={tuple(_buf_data.shape)}")
+    print(f"[prefill probe] buffer NaN anywhere: {_buf_any_nan}"
+          + (f"  first NaN row: {_buf_first_nan} / {prefill_steps} written"
+             if _buf_any_nan else ""))
+    print(f"[prefill probe] env_state.obs NaN: {_env_obs_nan}  "
+          f"obs[:, 0:3] = {env_state.obs[:1, 0:3]}")
+
     print(f"Starting {args.num_epochs} epochs.  Constraints: {args.use_constraints}")
     if args.use_constraints:
         if args.cost_type == "quadratic":

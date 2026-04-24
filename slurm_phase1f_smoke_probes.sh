@@ -188,7 +188,18 @@ for key, where in [
 assert "f\"         nan[obs_c=" in src, \
     "per-epoch probe one-liner missing from training print"
 
-print("Phase-1f base fix + NaN-forensics probe wiring verified in train.py.")
+# 7. Post-prefill probe (one-shot, before training loop). Localizes whether
+#    NaN enters the buffer during prefill (env emit under random action) or
+#    after prefill (first training step poisons actor params, next rollout
+#    contaminates buffer).
+assert "[prefill probe] buffer.data shape=" in src, \
+    "post-prefill buffer-shape probe missing from train.py"
+assert "[prefill probe] buffer NaN anywhere:" in src, \
+    "post-prefill buffer-NaN probe missing from train.py"
+assert "[prefill probe] env_state.obs NaN:" in src, \
+    "post-prefill env_state.obs NaN probe missing from train.py"
+
+print("Phase-1f base fix + NaN-forensics probe wiring + prefill probe verified in train.py.")
 PYCHECK
 
 if [ $? -ne 0 ]; then
