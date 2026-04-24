@@ -622,9 +622,20 @@ def main(args: Args):
         sa_repr_norm = jnp.mean(jnp.linalg.norm(sa_repr, axis=-1))
         g_repr_norm  = jnp.mean(jnp.linalg.norm(g_repr,  axis=-1))
 
+        # Phase-1f NaN-forensics probes (pure observability, no causal change).
+        # After Phase-1f smokes at both τ=0.1 and τ=1.0 produced identical
+        # step-1 NaN signatures, we need to localize NaN origin: buffer obs,
+        # encoder forward, zero-norm at the row-L2 divisor, or post-division.
+        sa_has_nan_c  = jnp.any(jnp.isnan(sa_repr)).astype(jnp.float32)
+        g_has_nan_c   = jnp.any(jnp.isnan(g_repr)).astype(jnp.float32)
+        obs_has_nan_c = jnp.any(jnp.isnan(obs)).astype(jnp.float32)
+        sa_norm_min_c = jnp.min(jnp.linalg.norm(sa_repr, axis=-1))
+        g_norm_min_c  = jnp.min(jnp.linalg.norm(g_repr,  axis=-1))
+
         sa_repr = sa_repr / (jnp.linalg.norm(sa_repr, axis=-1, keepdims=True) + 1e-8)
         g_repr  = g_repr  / (jnp.linalg.norm(g_repr,  axis=-1, keepdims=True) + 1e-8)
         logits = jnp.einsum("ik,jk->ij", sa_repr, g_repr) / args.tau
+        logits_has_nan_c = jnp.any(jnp.isnan(logits)).astype(jnp.float32)
         logsumexp_val = jax.nn.logsumexp(logits, axis=1)
         loss = -jnp.mean(jnp.diag(logits) - logsumexp_val)
         loss += args.logsumexp_penalty_coeff * jnp.mean(logsumexp_val ** 2)
@@ -634,7 +645,9 @@ def main(args: Args):
         logits_pos = jnp.sum(logits * I)       / jnp.sum(I)
         logits_neg = jnp.sum(logits * (1 - I)) / jnp.sum(1 - I)
         return loss, (logits_pos, logits_neg, jnp.mean(correct),
-                      jnp.mean(logsumexp_val), sa_repr_norm, g_repr_norm)
+                      jnp.mean(logsumexp_val), sa_repr_norm, g_repr_norm,
+                      sa_has_nan_c, g_has_nan_c, obs_has_nan_c,
+                      sa_norm_min_c, g_norm_min_c, logits_has_nan_c)
 
     def actor_loss_fn(actor_params, critic_params, log_alpha,
                       cost_critic_params, lambda_tilde, transitions, key):
@@ -675,9 +688,21 @@ def main(args: Args):
         sa_repr_norm_actor = jnp.mean(jnp.linalg.norm(sa_repr, axis=-1))
         g_repr_norm_actor  = jnp.mean(jnp.linalg.norm(g_repr,  axis=-1))
 
+        # Phase-1f NaN-forensics probes (actor path). Mirrors the critic-side
+        # probes so we can tell whether the actor's action already produced
+        # NaN before reaching the encoder, or whether the encoder itself
+        # produced NaN on a finite input.
+        action_has_nan_a = jnp.any(jnp.isnan(action)).astype(jnp.float32)
+        action_max_a     = jnp.max(jnp.abs(action))
+        sa_has_nan_a     = jnp.any(jnp.isnan(sa_repr)).astype(jnp.float32)
+        g_has_nan_a      = jnp.any(jnp.isnan(g_repr)).astype(jnp.float32)
+        sa_norm_min_a    = jnp.min(jnp.linalg.norm(sa_repr, axis=-1))
+        g_norm_min_a     = jnp.min(jnp.linalg.norm(g_repr,  axis=-1))
+
         sa_repr = sa_repr / (jnp.linalg.norm(sa_repr, axis=-1, keepdims=True) + 1e-8)
         g_repr  = g_repr  / (jnp.linalg.norm(g_repr,  axis=-1, keepdims=True) + 1e-8)
         f_sa_g  = jnp.sum(sa_repr * g_repr, axis=-1) / args.tau
+        f_has_nan_a = jnp.any(jnp.isnan(f_sa_g)).astype(jnp.float32)
 
         alpha = jnp.exp(log_alpha)
         # Preconditioned: divide f by ν_f to normalize InfoNCE scale
@@ -691,7 +716,10 @@ def main(args: Args):
             qc_pi = jnp.zeros_like(f_sa_g)
 
         return actor_loss, (log_prob, jnp.mean(qc_pi),
-                            sa_repr_norm_actor, g_repr_norm_actor)
+                            sa_repr_norm_actor, g_repr_norm_actor,
+                            sa_has_nan_a, g_has_nan_a,
+                            sa_norm_min_a, g_norm_min_a,
+                            action_has_nan_a, action_max_a, f_has_nan_a)
 
     def alpha_loss_fn(log_alpha, log_prob):
         return -jnp.mean(log_alpha * (log_prob + action_size))
@@ -816,15 +844,24 @@ def main(args: Args):
 
         # ── InfoNCE Critic update ─────────────────────────────
         # aux = (logits_pos, logits_neg, accuracy, logsumexp,
-        #        mean ‖φ‖ pre-normalize, mean ‖ψ‖ pre-normalize)
-        (c_loss, (lp, ln, acc, lse, sa_rn_crit, g_rn_crit)), c_grads = \
+        #        mean ‖φ‖ pre-normalize, mean ‖ψ‖ pre-normalize,
+        #        + Phase-1f NaN-forensics probes:
+        #        sa_nan_c, g_nan_c, obs_nan_c, sa_norm_min_c, g_norm_min_c, logits_nan_c)
+        (c_loss, (lp, ln, acc, lse, sa_rn_crit, g_rn_crit,
+                  sa_nan_c, g_nan_c, obs_nan_c,
+                  sa_nmin_c, g_nmin_c, logits_nan_c)), c_grads = \
             jax.value_and_grad(critic_loss_fn, has_aux=True)(
             training_state.critic_state.params, transitions, critic_key)
         critic_state = training_state.critic_state.apply_gradients(grads=c_grads)
 
         # ── Actor update (preconditioned Lagrangian) ──────────
-        # aux = (log_prob, mean_qc_pi, mean ‖φ‖ pre-normalize, mean ‖ψ‖ pre-normalize)
-        (a_loss, (log_prob, mean_qc_pi, sa_rn_act, g_rn_act)), a_grads = \
+        # aux = (log_prob, mean_qc_pi, mean ‖φ‖ pre-normalize, mean ‖ψ‖ pre-normalize,
+        #        + Phase-1f NaN-forensics probes:
+        #        sa_nan_a, g_nan_a, sa_norm_min_a, g_norm_min_a,
+        #        action_nan_a, action_max_a, f_nan_a)
+        (a_loss, (log_prob, mean_qc_pi, sa_rn_act, g_rn_act,
+                  sa_nan_a, g_nan_a, sa_nmin_a, g_nmin_a,
+                  action_nan_a, action_max_a, f_nan_a)), a_grads = \
             jax.value_and_grad(actor_loss_fn, has_aux=True)(
             training_state.actor_state.params,
             critic_state.params,
@@ -945,6 +982,28 @@ def main(args: Args):
             "g_repr_norm_critic":  g_rn_crit,
             "sa_repr_norm_actor":  sa_rn_act,
             "g_repr_norm_actor":   g_rn_act,
+            # Phase-1f NaN-forensics — scalar boolean flags (0.0 / 1.0) and mins.
+            # Any flag > 0 at epoch 1 names the NaN origin site:
+            #   obs_nan_c = 1  → buffer contamination (env emitted NaN into buffer)
+            #   sa_nan_c / g_nan_c = 1 (with obs_nan_c = 0) → encoder forward NaN
+            #   *_norm_min = 0  → row-L2 divides by +1e-8 on zero vector (not NaN but suspect)
+            #   logits_nan_c = 1 (with sa_nan_c = g_nan_c = 0) → cosine/τ pathology
+            #   action_nan_a = 1 → actor emits NaN action; upstream cause = actor enc NaN
+            #   action_max_a very large → tanh saturation precursor (should stay ≤ 1.0)
+            #   f_nan_a = 1  → actor reward term is NaN even with finite φ̂, ψ̂
+            "nan_obs_critic":      obs_nan_c,
+            "nan_sa_critic":       sa_nan_c,
+            "nan_g_critic":        g_nan_c,
+            "nan_logits_critic":   logits_nan_c,
+            "sa_norm_min_critic":  sa_nmin_c,
+            "g_norm_min_critic":   g_nmin_c,
+            "nan_sa_actor":        sa_nan_a,
+            "nan_g_actor":         g_nan_a,
+            "nan_action_actor":    action_nan_a,
+            "nan_f_actor":         f_nan_a,
+            "sa_norm_min_actor":   sa_nmin_a,
+            "g_norm_min_actor":    g_nmin_a,
+            "action_max_actor":    action_max_a,
             "cost_critic_loss": cc_m["cost_critic_loss"],
             "mean_step_cost":   cc_m["mean_step_cost"],
             "mean_d_wall":      cc_m["mean_d_wall"],
@@ -1214,6 +1273,22 @@ def main(args: Args):
             "g_repr_norm_critic":  float(jnp.mean(epoch_metrics["g_repr_norm_critic"])),
             "sa_repr_norm_actor":  float(jnp.mean(epoch_metrics["sa_repr_norm_actor"])),
             "g_repr_norm_actor":   float(jnp.mean(epoch_metrics["g_repr_norm_actor"])),
+            # Phase-1f NaN-forensics (max over grad-steps so a single NaN event
+            # flips the flag; min over norms so zero-norm shows up even if mean
+            # is finite). Values live in [0,1] for flags, ≥0 for mins/max.
+            "nan_obs_critic":     float(jnp.max(epoch_metrics["nan_obs_critic"])),
+            "nan_sa_critic":      float(jnp.max(epoch_metrics["nan_sa_critic"])),
+            "nan_g_critic":       float(jnp.max(epoch_metrics["nan_g_critic"])),
+            "nan_logits_critic":  float(jnp.max(epoch_metrics["nan_logits_critic"])),
+            "sa_norm_min_critic": float(jnp.min(epoch_metrics["sa_norm_min_critic"])),
+            "g_norm_min_critic":  float(jnp.min(epoch_metrics["g_norm_min_critic"])),
+            "nan_sa_actor":       float(jnp.max(epoch_metrics["nan_sa_actor"])),
+            "nan_g_actor":        float(jnp.max(epoch_metrics["nan_g_actor"])),
+            "nan_action_actor":   float(jnp.max(epoch_metrics["nan_action_actor"])),
+            "nan_f_actor":        float(jnp.max(epoch_metrics["nan_f_actor"])),
+            "sa_norm_min_actor":  float(jnp.min(epoch_metrics["sa_norm_min_actor"])),
+            "g_norm_min_actor":   float(jnp.min(epoch_metrics["g_norm_min_actor"])),
+            "action_max_actor":   float(jnp.max(epoch_metrics["action_max_actor"])),
             **eval_metrics,
         }
 
@@ -1247,6 +1322,24 @@ def main(args: Args):
                 f"Ĵ_c={log_dict['j_c_hat']:.4f} "
                 f"Qc={log_dict['mean_qc']:.4f}"
             )
+        # Phase-1f NaN-forensics one-liner. Always printed so the probe values
+        # appear next to c_loss/a_loss. Flags are 0/1 aggregated across the
+        # epoch's grad-steps (max); norms are per-epoch min; action_max is max.
+        print(
+            f"         nan[obs_c={log_dict['nan_obs_critic']:.0f} "
+            f"sa_c={log_dict['nan_sa_critic']:.0f} "
+            f"g_c={log_dict['nan_g_critic']:.0f} "
+            f"lg_c={log_dict['nan_logits_critic']:.0f} "
+            f"sa_a={log_dict['nan_sa_actor']:.0f} "
+            f"g_a={log_dict['nan_g_actor']:.0f} "
+            f"act_a={log_dict['nan_action_actor']:.0f} "
+            f"f_a={log_dict['nan_f_actor']:.0f}] "
+            f"‖φ‖min_c={log_dict['sa_norm_min_critic']:.3f} "
+            f"‖ψ‖min_c={log_dict['g_norm_min_critic']:.3f} "
+            f"‖φ‖min_a={log_dict['sa_norm_min_actor']:.3f} "
+            f"‖ψ‖min_a={log_dict['g_norm_min_actor']:.3f} "
+            f"|a|max={log_dict['action_max_actor']:.3f}"
+        )
 
         if args.track:
             wandb.log(log_dict, step=env_steps)
