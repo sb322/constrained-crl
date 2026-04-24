@@ -35,9 +35,16 @@
 #    • Row-L2 normalize φ, ψ inside BOTH critic_loss_fn and actor_loss_fn
 #          φ̂ = φ / ‖φ‖₂ ,   ψ̂ = ψ / ‖ψ‖₂
 #      so that ⟨φ̂, ψ̂⟩ = cos(φ, ψ) ∈ [−1, 1] is genuinely norm-bounded.
-#    • Divide the InfoNCE logits by a fixed temperature τ (args.tau, default 1.0).
-#      This is the explicit step Wang 2025 / JaxGCRL use and that our shipped
-#      code was missing.
+#    • Divide the InfoNCE logits by a fixed temperature  τ = 0.1  (per this
+#      run's experiment spec — slightly sharper than the paper-standard
+#      τ = 1/√D = 0.125 for D=64; still well within Wang 2025 / JaxGCRL
+#      operating range). One knob per run; τ-tuning is a separate branch.
+#    • With τ = 0.1 and ‖φ̂‖ = ‖ψ̂‖ = 1,  f = ⟨φ̂, ψ̂⟩ / τ  ∈  [−10, 10].
+#    • NEW diagnostic logging: mean ‖φ‖, ‖ψ‖ pre-normalize (both the critic
+#      pass and the actor pass). These four metrics are the smoking gun for
+#      the Phase-1d failure mode — if they grow monotonically the encoder is
+#      attempting to escape via rescaling and the row-L2 is the only reason
+#      actor_loss looks bounded.
 #
 #  All other knobs UNCHANGED from Phase-1d:
 #    env_id=ant_big_maze, num_envs=256, unroll_length=62, depth=4,
@@ -60,20 +67,33 @@
 #    PRIMARY (stability):
 #      train/actor_loss          EXPECTED |·| < 1e3 throughout (was 4.67e5 in 1d)
 #      train/critic_loss         EXPECTED finite, monotone-ish decrease from log(N)≈5.5
-#      train/correct             EXPECTED rising above 1/N = 1/256 within ~5 epochs
-#      train/logits_pos          EXPECTED in [ 0.3/τ ,  1.0/τ ] once trained
-#      train/logits_neg          EXPECTED in [−0.2/τ ,  0.3/τ ]
+#      train/accuracy            EXPECTED rising above 1/N = 1/256 within ~5 epochs
+#      train/logits_pos          EXPECTED in [ 3.0 , 10.0 ] once trained (= [0.3, 1.0]/τ)
+#      train/logits_neg          EXPECTED in [−2.0 ,  3.0 ]              (= [−0.2, 0.3]/τ)
 #      train/lambda_tilde        EXPECTED ≈ 0 after warmup (feasible regime)
+#
+#    REPRESENTATION-SCALING DIAGNOSTICS  (NEW — central to this experiment):
+#      train/sa_repr_norm_critic  mean ‖φ‖ (pre-normalize) in critic pass
+#      train/g_repr_norm_critic   mean ‖ψ‖ (pre-normalize) in critic pass
+#      train/sa_repr_norm_actor   mean ‖φ‖ (pre-normalize) in actor  pass
+#      train/g_repr_norm_actor    mean ‖ψ‖ (pre-normalize) in actor  pass
+#      EXPECTED: all four bounded, roughly stationary (O(1)–O(10)).
+#      RED FLAG:  any of the four grows monotonically across epochs. That means
+#                 the encoder is trying to escape via ‖φ‖·‖ψ‖, and the row-L2
+#                 is the ONLY reason actor_loss looks bounded — the underlying
+#                 instability is still there, just masked. Report this as a
+#                 first-class finding, do not call Phase-1f a pass.
 #
 #    SECONDARY (constraint accounting — sanity only):
 #      train/jhat_c              EXPECTED < 0.15 throughout
 #      train/hard_violation_rate EXPECTED ≤ 0.05
 #
-#    DIAGNOSTIC (τ health check — if these fire, τ is too flat):
+#    DIAGNOSTIC (τ health check — if these fire, τ is misconfigured):
 #      train/critic_loss plateaus at log(batch_size) ≈ 5.5 for > 10 epochs
-#      train/correct stays at ≈ 1/N throughout
-#      → drop τ from 1.0 to 0.5 and resubmit as phase1f_tau0p5. DO NOT change
-#        any other knob in that resubmission.
+#      train/accuracy stays at ≈ 1/N throughout
+#      → τ too flat; drop to 0.05 and resubmit as phase1f_tau0p05.
+#      Opposite: logits saturate near ±10, accuracy ≈ 1 with large pos/neg gap
+#      → τ too sharp; bump to 0.2. Either way, one knob per resubmission.
 #
 #  Pass criterion (same form as Phase-1d, all three must hold):
 #    (a) |train/actor_loss|_max  over all 50 epochs  <  1e3
@@ -138,8 +158,33 @@ assert "nu_f: float = 1.0" in src, \
     "nu_f default is not 1.0 — Option-A regressed"
 
 # --- Phase-1f row-L2 + temperature -------------------------------------------
-assert "tau: float = 1.0" in src, \
-    "args.tau default is not 1.0 — Phase-1f not applied"
+# This run's τ = 0.1 (experiment spec: clean stability test in isolation).
+# If this assert fires, either the wrong train.py is on PYTHONPATH or τ was
+# regressed to an earlier value (1.0 or 0.125).
+assert "tau: float = 0.1" in src, \
+    "args.tau default is not 0.1 — Phase-1f τ-scaling missing"
+
+# Representation-norm logging must be wired through (both loss functions +
+# per-step metrics dict + epoch log_dict).
+for probe, where in [
+    ("sa_repr_norm = jnp.mean(jnp.linalg.norm(sa_repr, axis=-1))",
+     "critic_loss_fn pre-normalize ‖φ‖ probe"),
+    ("g_repr_norm  = jnp.mean(jnp.linalg.norm(g_repr,  axis=-1))",
+     "critic_loss_fn pre-normalize ‖ψ‖ probe"),
+    ("sa_repr_norm_actor = jnp.mean(jnp.linalg.norm(sa_repr, axis=-1))",
+     "actor_loss_fn pre-normalize ‖φ‖ probe"),
+    ("g_repr_norm_actor  = jnp.mean(jnp.linalg.norm(g_repr,  axis=-1))",
+     "actor_loss_fn pre-normalize ‖ψ‖ probe"),
+    ('"sa_repr_norm_critic": sa_rn_crit,',
+     "per-step metrics wiring (sa_repr_norm_critic)"),
+    ('"g_repr_norm_critic":  g_rn_crit,',
+     "per-step metrics wiring (g_repr_norm_critic)"),
+    ('"sa_repr_norm_actor":  sa_rn_act,',
+     "per-step metrics wiring (sa_repr_norm_actor)"),
+    ('"g_repr_norm_actor":   g_rn_act,',
+     "per-step metrics wiring (g_repr_norm_actor)"),
+]:
+    assert probe in src, f"norm-logging probe missing — {where}"
 
 # Exactly two row-L2 normalizations of sa_repr and two of g_repr
 # (once in critic_loss_fn, once in actor_loss_fn)
@@ -222,67 +267,79 @@ PYCHECK
 echo ""
 echo "===== PHASE-1f DYNAMIC NORMALIZATION ASSERTION ====="
 "$PYTHON" - <<'PYCHECK'
-import jax, jax.numpy as jnp, numpy as np
-from train import build_contrastive_encoders, Args  # noqa: will adapt below
+# Build the actual SA_encoder and G_encoder classes from train.py (safe to
+# import: train.py is guarded by `if __name__ == "__main__"`, so importing
+# does NOT launch a training run).
+#
+# Phase-1f CLI config we will launch with:
+#   --obs_dim 29    --goal_start_idx 0  --goal_end_idx 3
+#   --critic_depth 4   --critic_network_width 256
+#   (Ant action_size = 8, so sa input dim = 29 + 8 = 37; goal dim = 3)
+import jax, jax.numpy as jnp
+from train import SA_encoder, G_encoder, Args
 
-# We avoid importing internal builders that require full training state.
-# Instead, mirror the encoder construction directly from train.py (4-block
-# Wang residual, width=256, depth=4) and check the normalization identity.
-import train as T
+args = Args()  # Phase-1f defaults: tau=0.1, nu_f=1.0, normalize_observations=True
 
-args = T.Args()  # defaults ⇒ Phase-1f config (tau=1.0, nu_f=1.0, obs-norm=True)
+# Phase-1f run uses ant_big_maze → explicit dims (NOT Args.obs_dim which
+# defaults to 265 for the Humanoid config in train.py).
+OBS_DIM    = 29
+ACTION_DIM = 8          # Ant
+GOAL_DIM   = 3          # x,y,z torso position
+WIDTH      = 256
+DEPTH      = 4
+SKIP       = 0          # args.critic_skip_connections default
 
-sa_enc, g_enc = T.build_contrastive_encoders(
-    obs_dim=args.obs_dim,
-    action_dim=8,           # Ant action dim
-    goal_dim=args.goal_end_idx - args.goal_start_idx,
-    width=args.critic_network_width,
-    depth=args.critic_depth,
-    repr_dim=args.critic_network_width,
-)
+sa_enc = SA_encoder(network_width=WIDTH, network_depth=DEPTH, skip_connections=SKIP)
+g_enc  = G_encoder(network_width=WIDTH, network_depth=DEPTH, skip_connections=SKIP)
 
 key = jax.random.PRNGKey(0)
 k_sa, k_g, k_batch = jax.random.split(key, 3)
-sa_params = sa_enc.init(
-    k_sa,
-    jnp.zeros((4, args.obs_dim)), jnp.zeros((4, 8))
-)
-g_params  = g_enc.init(
-    k_g,
-    jnp.zeros((4, args.goal_end_idx - args.goal_start_idx))
-)
+sa_params = sa_enc.init(k_sa, jnp.zeros((4, OBS_DIM)), jnp.zeros((4, ACTION_DIM)))
+g_params  = g_enc.init(k_g,  jnp.zeros((4, GOAL_DIM)))
 
-# Batch of random inputs
+# Batch of Gaussian inputs — non-trivial, so we really exercise the encoder.
 N = 64
-obs_batch  = jax.random.normal(k_batch, (N, args.obs_dim))
-act_batch  = jax.random.normal(k_batch, (N, 8))
-goal_batch = jax.random.normal(k_batch, (N, args.goal_end_idx - args.goal_start_idx))
+obs_batch  = jax.random.normal(k_batch, (N, OBS_DIM))
+act_batch  = jax.random.normal(k_batch, (N, ACTION_DIM))
+goal_batch = jax.random.normal(k_batch, (N, GOAL_DIM))
 
 sa = sa_enc.apply(sa_params, obs_batch, act_batch)
 g  = g_enc.apply(g_params,  goal_batch)
 
-# Apply the same row-L2 normalization the loss functions use
+# Pre-normalization norms — expected to span orders of magnitude because the
+# trailing Dense layer is unconstrained. This is the Phase-1d failure mode we
+# are guarding against; document it in the log before normalizing.
+sa_raw_norms = jnp.linalg.norm(sa, axis=-1)
+g_raw_norms  = jnp.linalg.norm(g,  axis=-1)
+print(f"‖φ‖ (raw)  min/mean/max = {float(sa_raw_norms.min()):.4f} / "
+      f"{float(sa_raw_norms.mean()):.4f} / {float(sa_raw_norms.max()):.4f}")
+print(f"‖ψ‖ (raw)  min/mean/max = {float(g_raw_norms.min()):.4f} / "
+      f"{float(g_raw_norms.mean()):.4f} / {float(g_raw_norms.max()):.4f}")
+
+# Apply the exact row-L2 normalization the loss functions use
 sa_hat = sa / (jnp.linalg.norm(sa, axis=-1, keepdims=True) + 1e-8)
 g_hat  = g  / (jnp.linalg.norm(g,  axis=-1, keepdims=True) + 1e-8)
 
 sa_norms = jnp.linalg.norm(sa_hat, axis=-1)
 g_norms  = jnp.linalg.norm(g_hat,  axis=-1)
-print(f"‖φ̂‖  min/mean/max = {float(sa_norms.min()):.6f} / "
+print(f"‖φ̂‖       min/mean/max = {float(sa_norms.min()):.6f} / "
       f"{float(sa_norms.mean()):.6f} / {float(sa_norms.max()):.6f}")
-print(f"‖ψ̂‖  min/mean/max = {float(g_norms.min()):.6f} / "
+print(f"‖ψ̂‖       min/mean/max = {float(g_norms.min()):.6f} / "
       f"{float(g_norms.mean()):.6f} / {float(g_norms.max()):.6f}")
 
 assert jnp.allclose(sa_norms, 1.0, atol=1e-5), \
-    f"‖φ̂‖ not unit-norm on a real batch — row-L2 normalize broken"
+    "‖φ̂‖ not unit-norm on a real batch — row-L2 normalize broken"
 assert jnp.allclose(g_norms,  1.0, atol=1e-5), \
-    f"‖ψ̂‖ not unit-norm on a real batch — row-L2 normalize broken"
+    "‖ψ̂‖ not unit-norm on a real batch — row-L2 normalize broken"
 
-# Sanity: cosine energy must lie in [−1, 1]/τ
+# Sanity: cosine energy must lie in [−1/τ, 1/τ]
 logits = jnp.einsum("ik,jk->ij", sa_hat, g_hat) / args.tau
-print(f"logits  min/max   = {float(logits.min()):.4f} / {float(logits.max()):.4f}"
-      f"   (τ = {args.tau})")
-assert float(logits.max()) <=  1.0 / args.tau + 1e-5
-assert float(logits.min()) >= -1.0 / args.tau - 1e-5
+print(f"logits     min/max      = {float(logits.min()):.4f} / "
+      f"{float(logits.max()):.4f}   (τ = {args.tau})")
+assert float(logits.max()) <=  1.0 / args.tau + 1e-5, \
+    "cosine logits exceed +1/τ — normalization broken"
+assert float(logits.min()) >= -1.0 / args.tau - 1e-5, \
+    "cosine logits fall below −1/τ — normalization broken"
 print("Phase-1f dynamic normalization OK — φ̂, ψ̂ on the unit sphere, "
       "logits ∈ [−1/τ, 1/τ].")
 PYCHECK
@@ -295,7 +352,7 @@ fi
 echo ""
 echo "===== PHASE-1f LAUNCH  $(date) ====="
 
-# Note: Phase-1f defaults live in train.py (tau=1.0, plus all surviving
+# Note: Phase-1f defaults live in train.py (tau=0.1, plus all surviving
 # Option-A defaults). We do NOT override them on the CLI. Overriding would
 # silently defeat the purpose of this run.
 

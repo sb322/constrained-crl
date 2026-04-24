@@ -120,10 +120,13 @@ class Args:
     nu_f: float = 1.0               # Option-A: no preconditioning shrinkage, match scaling-crl actor scale. 0 = auto → log(batch_size) (legacy)
     nu_c: float = 0.0               # 0 = auto → 1/(1-gamma)
     # Phase-1f: temperature for cosine InfoNCE logits ⟨φ̂, ψ̂⟩ / τ.
-    # τ = 1.0 → pure cosine similarity ∈ [−1, 1].
-    # Drop τ to 0.5 or 0.1 ONLY if InfoNCE loss plateaus at log(batch_size) and
-    # acc stays at 1/N — that is a τ-tuning branch, not a new hypothesis.
-    tau: float = 1.0
+    # For this run we pin τ = 0.1 (per experiment spec: clean stability test
+    # in isolation of representation scaling). Paper-standard value is
+    # τ = 1/√D = 0.125 (D=64 = final Dense in SA_encoder/G_encoder); τ=0.1
+    # is slightly sharper than that, well within the Wang 2025 / JaxGCRL
+    # operating range. Keep overridable via --tau for a τ-tuning branch.
+    # One knob per run: do NOT bundle τ changes with other interventions.
+    tau: float = 0.1
     # Cost critic architecture
     cost_critic_lr: float = 3e-4
     cost_critic_width: int = 256
@@ -609,6 +612,16 @@ def main(args: Args):
         # what destroyed Phase-1b (|a_loss| → −4.86e5) AND Phase-1d Option-A
         # (|a_loss| → −4.67e5) at λ̃ = 0. Dividing by args.tau controls the
         # softmax temperature for the InfoNCE log-likelihood.
+
+        # Diagnostic: mean ‖φ‖, ‖ψ‖ BEFORE normalization — the Phase-1d escape
+        # route (growing representations to drive ⟨φ,ψ⟩ → ∞) will show here
+        # even while the post-normalization cosine logits stay bounded. If
+        # these grow monotonically while critic_loss stays flat, the row-L2
+        # is masking a runaway encoder — the signal we care about per the
+        # stability-isolation experiment spec.
+        sa_repr_norm = jnp.mean(jnp.linalg.norm(sa_repr, axis=-1))
+        g_repr_norm  = jnp.mean(jnp.linalg.norm(g_repr,  axis=-1))
+
         sa_repr = sa_repr / (jnp.linalg.norm(sa_repr, axis=-1, keepdims=True) + 1e-8)
         g_repr  = g_repr  / (jnp.linalg.norm(g_repr,  axis=-1, keepdims=True) + 1e-8)
         logits = jnp.einsum("ik,jk->ij", sa_repr, g_repr) / args.tau
@@ -620,7 +633,8 @@ def main(args: Args):
         correct  = jnp.argmax(logits, axis=1) == jnp.argmax(I, axis=1)
         logits_pos = jnp.sum(logits * I)       / jnp.sum(I)
         logits_neg = jnp.sum(logits * (1 - I)) / jnp.sum(1 - I)
-        return loss, (logits_pos, logits_neg, jnp.mean(correct), jnp.mean(logsumexp_val))
+        return loss, (logits_pos, logits_neg, jnp.mean(correct),
+                      jnp.mean(logsumexp_val), sa_repr_norm, g_repr_norm)
 
     def actor_loss_fn(actor_params, critic_params, log_alpha,
                       cost_critic_params, lambda_tilde, transitions, key):
@@ -653,6 +667,14 @@ def main(args: Args):
         # broken Phase-1d claim that LayerNorm alone bounded ‖φ‖, ‖ψ‖.
         sa_repr = sa_encoder.apply(critic_params["sa_encoder"], state, action)
         g_repr  = g_encoder.apply(critic_params["g_encoder"],  goal)
+
+        # Diagnostic (pre-normalization): mean ‖φ‖, ‖ψ‖ seen by the actor.
+        # Should stay finite. If it grows while actor_loss also grows, the
+        # actor is exploiting encoder rescaling as its minimization route —
+        # exactly the failure mode the row-L2 is meant to foreclose.
+        sa_repr_norm_actor = jnp.mean(jnp.linalg.norm(sa_repr, axis=-1))
+        g_repr_norm_actor  = jnp.mean(jnp.linalg.norm(g_repr,  axis=-1))
+
         sa_repr = sa_repr / (jnp.linalg.norm(sa_repr, axis=-1, keepdims=True) + 1e-8)
         g_repr  = g_repr  / (jnp.linalg.norm(g_repr,  axis=-1, keepdims=True) + 1e-8)
         f_sa_g  = jnp.sum(sa_repr * g_repr, axis=-1) / args.tau
@@ -668,7 +690,8 @@ def main(args: Args):
         else:
             qc_pi = jnp.zeros_like(f_sa_g)
 
-        return actor_loss, (log_prob, jnp.mean(qc_pi))
+        return actor_loss, (log_prob, jnp.mean(qc_pi),
+                            sa_repr_norm_actor, g_repr_norm_actor)
 
     def alpha_loss_fn(log_alpha, log_prob):
         return -jnp.mean(log_alpha * (log_prob + action_size))
@@ -792,14 +815,17 @@ def main(args: Args):
         key, critic_key, actor_key, cost_key, dual_key = jax.random.split(key, 5)
 
         # ── InfoNCE Critic update ─────────────────────────────
-        (c_loss, (lp, ln, acc, lse)), c_grads = jax.value_and_grad(
-            critic_loss_fn, has_aux=True)(
+        # aux = (logits_pos, logits_neg, accuracy, logsumexp,
+        #        mean ‖φ‖ pre-normalize, mean ‖ψ‖ pre-normalize)
+        (c_loss, (lp, ln, acc, lse, sa_rn_crit, g_rn_crit)), c_grads = \
+            jax.value_and_grad(critic_loss_fn, has_aux=True)(
             training_state.critic_state.params, transitions, critic_key)
         critic_state = training_state.critic_state.apply_gradients(grads=c_grads)
 
         # ── Actor update (preconditioned Lagrangian) ──────────
-        (a_loss, (log_prob, mean_qc_pi)), a_grads = jax.value_and_grad(
-            actor_loss_fn, has_aux=True)(
+        # aux = (log_prob, mean_qc_pi, mean ‖φ‖ pre-normalize, mean ‖ψ‖ pre-normalize)
+        (a_loss, (log_prob, mean_qc_pi, sa_rn_act, g_rn_act)), a_grads = \
+            jax.value_and_grad(actor_loss_fn, has_aux=True)(
             training_state.actor_state.params,
             critic_state.params,
             training_state.alpha_state.params,
@@ -910,6 +936,15 @@ def main(args: Args):
             "logits_neg":       ln,
             "accuracy":         acc,
             "logsumexp":        lse,
+            # Phase-1f representation-scaling diagnostics (pre-normalize norms).
+            # *_critic come from the critic pass (goals from future buffer);
+            # *_actor come from the actor pass (goals from current policy).
+            # Both should stay bounded if row-L2 is genuinely isolating the
+            # stability question from encoder-rescale escapes.
+            "sa_repr_norm_critic": sa_rn_crit,
+            "g_repr_norm_critic":  g_rn_crit,
+            "sa_repr_norm_actor":  sa_rn_act,
+            "g_repr_norm_actor":   g_rn_act,
             "cost_critic_loss": cc_m["cost_critic_loss"],
             "mean_step_cost":   cc_m["mean_step_cost"],
             "mean_d_wall":      cc_m["mean_d_wall"],
@@ -1169,6 +1204,16 @@ def main(args: Args):
             "actor_loss":  float(jnp.mean(epoch_metrics["actor_loss"])),
             "alpha":       float(jnp.mean(epoch_metrics["alpha"])),
             "alpha_loss":  float(jnp.mean(epoch_metrics["alpha_loss"])),
+            # Phase-1f representation-scaling diagnostics
+            #   _critic: ‖φ‖, ‖ψ‖ (pre-normalize) seen in the InfoNCE pass
+            #   _actor : ‖φ‖, ‖ψ‖ (pre-normalize) seen by the actor pass
+            # All four should stay bounded and roughly stationary. Monotone
+            # growth here is the direct signature of the Phase-1d failure
+            # mode we are guarding against.
+            "sa_repr_norm_critic": float(jnp.mean(epoch_metrics["sa_repr_norm_critic"])),
+            "g_repr_norm_critic":  float(jnp.mean(epoch_metrics["g_repr_norm_critic"])),
+            "sa_repr_norm_actor":  float(jnp.mean(epoch_metrics["sa_repr_norm_actor"])),
+            "g_repr_norm_actor":   float(jnp.mean(epoch_metrics["g_repr_norm_actor"])),
             **eval_metrics,
         }
 
