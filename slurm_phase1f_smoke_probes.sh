@@ -283,7 +283,34 @@ for key, where in [
 assert "f\"         grad[c=" in src, \
     "per-epoch grad/param print line missing from training loop"
 
-print("Phase-1f base fix + forward NaN probes + prefill probe + grad/param NaN probes verified in train.py.")
+# 9. Epoch-1 time-series forensics (host-side, one-shot at epoch == 0).
+#    Job 985769 confirmed every NaN flag fires by end of epoch 1, but
+#    per-epoch jnp.max cannot localize WHICH sgd-step within epoch 1
+#    fired first. This dump emits the flat index of the first 1-flag
+#    for each NaN signal plus the first 5 grad-norm values, so we can
+#    distinguish (a) loss autograd is broken from clean init from
+#    (b) optimizer apply poisons params later in the epoch.
+assert "[epoch1 forensics]" in src, \
+    "epoch-1 forensics one-shot dump missing from training loop"
+assert "def _first_one_idx(arr):" in src, \
+    "epoch-1 forensics _first_one_idx helper missing"
+assert "def _decode(flat_idx):" in src, \
+    "epoch-1 forensics _decode helper missing"
+assert "sgd_per_step = args.num_update_epochs * args.num_minibatches" in src, \
+    "epoch-1 forensics sgd_per_step calculation missing"
+# Confirm key signals are queried in the dump (sample three to keep the
+# assert tight without enumerating all 13).
+for query, where in [
+    ('"c_grad_nan",       "c_grad_nan"',     "c_grad_nan first-index query"),
+    ('"c_params_nan",     "c_params_nan"',   "c_params_nan first-index query"),
+    ('"nan_obs_critic",   "nan_obs_critic"', "nan_obs_critic first-index query"),
+]:
+    assert query in src, f"epoch-1 forensics missing — {where}"
+# Confirm grad-norm head dump is wired (catches dropping the [:5] block)
+assert '"c_grad_norm",   "c_grad_norm"' in src, \
+    "epoch-1 forensics grad_norm head dump missing"
+
+print("Phase-1f base fix + forward NaN probes + prefill probe + grad/param NaN probes + epoch-1 time-series dump verified in train.py.")
 PYCHECK
 
 if [ $? -ne 0 ]; then

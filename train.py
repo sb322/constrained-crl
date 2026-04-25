@@ -1329,6 +1329,93 @@ def main(args: Args):
             (training_state, env_state, buffer_state, rng), ()
         )
 
+        # Phase-1f epoch-1 time-series forensics (one-shot, host-side).
+        # epoch_metrics[k] has shape (steps_per_epoch, num_update_epochs *
+        # num_minibatches). Per-epoch jnp.max collapsed both axes and only
+        # told us "everything was NaN by end of epoch 1". This dump finds
+        # the FIRST sgd-step where each NaN flag fired, plus the first few
+        # grad-norm values, so we can localize the origin within epoch 1.
+        #
+        # Decision tree on the output:
+        #   c_grad_nan first at flat_idx = 0   →  critic-loss autograd produces
+        #                                          NaN from clean init params on
+        #                                          a clean prefill batch. The
+        #                                          loss has an analytical
+        #                                          singularity (most likely
+        #                                          cosine logits / τ overflow
+        #                                          → softmax saturation → log 0).
+        #   c_grad_nan first at flat_idx > 0  →  the optimizer apply at the
+        #                                          previous step produced NaN
+        #                                          params; check c_params_nan
+        #                                          at flat_idx − 1.
+        #   c_params_nan first at flat_idx with c_grad_nan first at flat_idx + 1
+        #                                       →  Adam's update poisoned params
+        #                                          even from a finite gradient.
+        #   nan_obs_critic first at flat_idx ≫ first-grad-NaN
+        #                                       →  buffer was clean while early
+        #                                          grad-NaN built up; later
+        #                                          rollout under NaN actor
+        #                                          contaminated the buffer.
+        if epoch == 0:
+            sgd_per_step = args.num_update_epochs * args.num_minibatches
+            def _first_one_idx(arr):
+                """Return flat index of first 1.0 (or NaN treated as 1) entry,
+                or -1 if the array is all-zero. Works for the per-step boolean
+                flags we inserted in metrics."""
+                a = jnp.asarray(arr).reshape(-1)
+                # Flag is 1.0 / 0.0 float; treat any positive entry as a hit.
+                hits = a > 0.0
+                if not bool(jnp.any(hits)):
+                    return -1
+                return int(jnp.argmax(hits.astype(jnp.int32)))
+
+            def _decode(flat_idx):
+                if flat_idx < 0:
+                    return "(never)"
+                it, sg = divmod(flat_idx, sgd_per_step)
+                return f"flat={flat_idx}  iter={it}  sgd={sg}"
+
+            print("[epoch1 forensics] sgd_per_step=", sgd_per_step,
+                  "steps_per_epoch=", epoch_metrics["c_grad_nan"].shape[0])
+            for label, key in [
+                ("c_grad_nan",       "c_grad_nan"),
+                ("c_params_nan",     "c_params_nan"),
+                ("a_grad_nan",       "a_grad_nan"),
+                ("a_params_nan",     "a_params_nan"),
+                ("cc_grad_nan",      "cc_grad_nan"),
+                ("cc_params_nan",    "cc_params_nan"),
+                ("nan_obs_critic",   "nan_obs_critic"),
+                ("nan_sa_critic",    "nan_sa_critic"),
+                ("nan_g_critic",     "nan_g_critic"),
+                ("nan_logits_critic","nan_logits_critic"),
+                ("nan_sa_actor",     "nan_sa_actor"),
+                ("nan_action_actor", "nan_action_actor"),
+                ("nan_f_actor",      "nan_f_actor"),
+            ]:
+                idx = _first_one_idx(epoch_metrics[key])
+                print(f"  first {label:<20s}: {_decode(idx)}")
+
+            # First 5 grad-norms and first 5 params-NaN flags. If
+            # c_grad_norm[0] is finite, the very first backward on clean
+            # init+clean batch is finite — so the cascade starts at the
+            # optimizer apply, not in the loss autograd.
+            for label, key in [
+                ("c_grad_norm",   "c_grad_norm"),
+                ("a_grad_norm",   "a_grad_norm"),
+                ("cc_grad_norm",  "cc_grad_norm"),
+            ]:
+                v = jnp.asarray(epoch_metrics[key]).reshape(-1)
+                head = [float(x) for x in v[:5]]
+                print(f"  {label}[:5] = {head}")
+            for label, key in [
+                ("c_params_nan",  "c_params_nan"),
+                ("a_params_nan",  "a_params_nan"),
+                ("cc_params_nan", "cc_params_nan"),
+            ]:
+                v = jnp.asarray(epoch_metrics[key]).reshape(-1)
+                head = [float(x) for x in v[:5]]
+                print(f"  {label}[:5] = {head}")
+
         dur = time.time() - t0
         env_steps  = int(training_state.env_steps)
         grad_steps = int(training_state.gradient_steps)
