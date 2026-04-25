@@ -199,7 +199,91 @@ assert "[prefill probe] buffer NaN anywhere:" in src, \
 assert "[prefill probe] env_state.obs NaN:" in src, \
     "post-prefill env_state.obs NaN probe missing from train.py"
 
-print("Phase-1f base fix + NaN-forensics probe wiring + prefill probe verified in train.py.")
+# 8. Gradient/post-update param NaN forensics (the new payload for THIS run).
+#    We localize *which* of the three gradient steps within sgd_step first
+#    produces NaN. Reading order: forward NaN flag set + grad_nan = 0
+#    → corruption rode in via buffer. grad_nan = 1 → autograd path of that
+#    loss is the source. grad_nan = 0 + params_nan = 1 → optimizer apply
+#    produced NaN params. Both must be wired through sgd_step → metrics →
+#    log_dict → print.
+
+# 8a. Helper functions
+assert "def _grads_have_nan(grads):" in src, \
+    "_grads_have_nan helper missing"
+assert "def _grads_global_norm(grads):" in src, \
+    "_grads_global_norm helper missing"
+assert "def _params_have_nan(params):" in src, \
+    "_params_have_nan helper missing"
+
+# 8b. Probe computation (3 sites: critic, actor, cost critic)
+for line, where in [
+    ("c_grad_nan  = _grads_have_nan(c_grads)",       "critic grad NaN"),
+    ("c_grad_norm = _grads_global_norm(c_grads)",    "critic grad norm"),
+    ("c_params_nan = _params_have_nan(critic_state.params)",
+     "critic post-update params NaN"),
+    ("a_grad_nan  = _grads_have_nan(a_grads)",       "actor grad NaN"),
+    ("a_grad_norm = _grads_global_norm(a_grads)",    "actor grad norm"),
+    ("a_params_nan = _params_have_nan(actor_state.params)",
+     "actor post-update params NaN"),
+    ("cc_grad_nan  = _grads_have_nan(cc_grads)",     "cost-critic grad NaN"),
+    ("cc_grad_norm = _grads_global_norm(cc_grads)",  "cost-critic grad norm"),
+    ("cc_params_nan = _params_have_nan(cost_critic_state_new.params)",
+     "cost-critic post-update params NaN"),
+]:
+    assert line in src, f"grad/param probe computation missing — {where}"
+
+# 8c. Zero-placeholders in the no-constraints branch (so jax.lax.scan sees
+#     a consistent metrics pytree shape across both code paths)
+assert "cc_grad_nan   = jnp.zeros(())" in src, \
+    "cc_grad_nan zero placeholder missing in no-constraints branch"
+assert "cc_grad_norm  = jnp.zeros(())" in src, \
+    "cc_grad_norm zero placeholder missing in no-constraints branch"
+assert "cc_params_nan = jnp.zeros(())" in src, \
+    "cc_params_nan zero placeholder missing in no-constraints branch"
+
+# 8d. Metrics dict keys (sgd_step return)
+for key, where in [
+    ('"c_grad_nan":     c_grad_nan,',   "metrics: c_grad_nan"),
+    ('"c_grad_norm":    c_grad_norm,',  "metrics: c_grad_norm"),
+    ('"c_params_nan":   c_params_nan,', "metrics: c_params_nan"),
+    ('"a_grad_nan":     a_grad_nan,',   "metrics: a_grad_nan"),
+    ('"a_grad_norm":    a_grad_norm,',  "metrics: a_grad_norm"),
+    ('"a_params_nan":   a_params_nan,', "metrics: a_params_nan"),
+    ('"cc_grad_nan":    cc_grad_nan,',  "metrics: cc_grad_nan"),
+    ('"cc_grad_norm":   cc_grad_norm,', "metrics: cc_grad_norm"),
+    ('"cc_params_nan":  cc_params_nan,',"metrics: cc_params_nan"),
+]:
+    assert key in src, f"metrics dict missing grad/param key — {where}"
+
+# 8e. log_dict aggregations (max for NaN flags; max for grad norms — runaway
+#     spike must surface even if mean is finite)
+for key, where in [
+    ('"c_grad_nan":     float(jnp.max(epoch_metrics["c_grad_nan"])),',
+     "log_dict: c_grad_nan"),
+    ('"c_grad_norm":    float(jnp.max(epoch_metrics["c_grad_norm"])),',
+     "log_dict: c_grad_norm"),
+    ('"c_params_nan":   float(jnp.max(epoch_metrics["c_params_nan"])),',
+     "log_dict: c_params_nan"),
+    ('"a_grad_nan":     float(jnp.max(epoch_metrics["a_grad_nan"])),',
+     "log_dict: a_grad_nan"),
+    ('"a_grad_norm":    float(jnp.max(epoch_metrics["a_grad_norm"])),',
+     "log_dict: a_grad_norm"),
+    ('"a_params_nan":   float(jnp.max(epoch_metrics["a_params_nan"])),',
+     "log_dict: a_params_nan"),
+    ('"cc_grad_nan":    float(jnp.max(epoch_metrics["cc_grad_nan"])),',
+     "log_dict: cc_grad_nan"),
+    ('"cc_grad_norm":   float(jnp.max(epoch_metrics["cc_grad_norm"])),',
+     "log_dict: cc_grad_norm"),
+    ('"cc_params_nan":  float(jnp.max(epoch_metrics["cc_params_nan"])),',
+     "log_dict: cc_params_nan"),
+]:
+    assert key in src, f"log_dict missing grad/param aggregation — {where}"
+
+# 8f. Per-epoch grad/param print line
+assert "f\"         grad[c=" in src, \
+    "per-epoch grad/param print line missing from training loop"
+
+print("Phase-1f base fix + forward NaN probes + prefill probe + grad/param NaN probes verified in train.py.")
 PYCHECK
 
 if [ $? -ne 0 ]; then

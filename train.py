@@ -838,6 +838,27 @@ def main(args: Args):
         j_c_hat = (1.0 - args.gamma) * jnp.mean(v_c)
         return j_c_hat
 
+    # Phase-1f gradient/param NaN-forensics helpers (used inside sgd_step).
+    # _grads_have_nan returns 1.0 if any leaf of the gradient pytree contains
+    #   NaN — fingerprints "loss → grad chain produced NaN".
+    # _grads_global_norm = sqrt(sum(‖leaf‖²)) — finite-but-huge means runaway.
+    # _params_have_nan returns 1.0 if any post-update param leaf is NaN —
+    #   fingerprints "optimizer step poisoned the params".
+    def _grads_have_nan(grads):
+        leaves = jax.tree_util.tree_leaves(grads)
+        flags = jnp.stack([jnp.any(jnp.isnan(x)) for x in leaves])
+        return jnp.any(flags).astype(jnp.float32)
+
+    def _grads_global_norm(grads):
+        leaves = jax.tree_util.tree_leaves(grads)
+        sq = sum(jnp.sum(x * x) for x in leaves)
+        return jnp.sqrt(sq)
+
+    def _params_have_nan(params):
+        leaves = jax.tree_util.tree_leaves(params)
+        flags = jnp.stack([jnp.any(jnp.isnan(x)) for x in leaves])
+        return jnp.any(flags).astype(jnp.float32)
+
     def sgd_step(carry, transitions):
         training_state, key = carry
         key, critic_key, actor_key, cost_key, dual_key = jax.random.split(key, 5)
@@ -852,7 +873,13 @@ def main(args: Args):
                   sa_nmin_c, g_nmin_c, logits_nan_c)), c_grads = \
             jax.value_and_grad(critic_loss_fn, has_aux=True)(
             training_state.critic_state.params, transitions, critic_key)
+        # Gradient diagnostics (Phase-1f forensics):
+        #   c_grad_nan = 1 if any leaf is NaN  →  loss → grad chain broke
+        #   c_grad_norm reports magnitude; finite-but-huge means runaway
+        c_grad_nan  = _grads_have_nan(c_grads)
+        c_grad_norm = _grads_global_norm(c_grads)
         critic_state = training_state.critic_state.apply_gradients(grads=c_grads)
+        c_params_nan = _params_have_nan(critic_state.params)
 
         # ── Actor update (preconditioned Lagrangian) ──────────
         # aux = (log_prob, mean_qc_pi, mean ‖φ‖ pre-normalize, mean ‖ψ‖ pre-normalize,
@@ -871,7 +898,11 @@ def main(args: Args):
             transitions,
             actor_key,
         )
+        # Actor-side gradient diagnostics
+        a_grad_nan  = _grads_have_nan(a_grads)
+        a_grad_norm = _grads_global_norm(a_grads)
         actor_state = training_state.actor_state.apply_gradients(grads=a_grads)
+        a_params_nan = _params_have_nan(actor_state.params)
 
         # ── SAC entropy alpha ─────────────────────────────────
         al_loss, al_grads = jax.value_and_grad(alpha_loss_fn)(
@@ -889,8 +920,11 @@ def main(args: Args):
                 transitions,
                 cost_key,
             )
+            cc_grad_nan  = _grads_have_nan(cc_grads)
+            cc_grad_norm = _grads_global_norm(cc_grads)
             cost_critic_state_new = training_state.cost_critic_state.apply_gradients(
                 grads=cc_grads)
+            cc_params_nan = _params_have_nan(cost_critic_state_new.params)
 
             # Polyak target update
             tau = args.cost_critic_tau
@@ -950,6 +984,9 @@ def main(args: Args):
                     ["cost_critic_loss", "mean_step_cost", "mean_d_wall",
                      "hard_violation_rate", "mean_qc"]}
             j_c_hat_metric = jnp.zeros(())
+            cc_grad_nan   = jnp.zeros(())
+            cc_grad_norm  = jnp.zeros(())
+            cc_params_nan = jnp.zeros(())
 
         new_ts = TrainingState(
             env_steps=training_state.env_steps,
@@ -1004,6 +1041,35 @@ def main(args: Args):
             "sa_norm_min_actor":   sa_nmin_a,
             "g_norm_min_actor":    g_nmin_a,
             "action_max_actor":    action_max_a,
+            # Phase-1f gradient/param NaN-forensics. These localize *which* of
+            # the three gradient steps within sgd_step first produces NaN, and
+            # whether the optimizer apply produced NaN params (vs. NaN-grad
+            # → finite params via Adam's epsilon). Reading order:
+            #   c_grad_nan  = 1 → critic_loss_fn → grad chain produced NaN
+            #     (with all forward probes finite, this points at the autograd
+            #      path through row-L2 / cosine / xent, not the forward eval)
+            #   c_grad_norm finite-but-huge → runaway, not NaN. Combine with
+            #     c_params_nan to disambiguate "Adam clamped" vs "params survived"
+            #   c_params_nan = 1 → critic_state.apply_gradients produced NaN
+            #     params (Adam moments saturated or NaN propagated through
+            #     update). Critical: NaN params here will poison every
+            #     subsequent forward pass — actor reads critic.params via
+            #     stop_grad in actor_loss_fn? No — actor reads its own params.
+            #     But cost_critic uses actor_state.params in its dual estimator,
+            #     so a NaN actor poisons cost critic too.
+            #   a_*: same logic, but actor params poison the next rollout
+            #     (collect_step → tanh(means + std·N) → action NaN → buffer NaN)
+            #   cc_*: same logic; cost critic NaN doesn't poison rollout but
+            #     poisons λ̃ via dual estimator.
+            "c_grad_nan":     c_grad_nan,
+            "c_grad_norm":    c_grad_norm,
+            "c_params_nan":   c_params_nan,
+            "a_grad_nan":     a_grad_nan,
+            "a_grad_norm":    a_grad_norm,
+            "a_params_nan":   a_params_nan,
+            "cc_grad_nan":    cc_grad_nan,
+            "cc_grad_norm":   cc_grad_norm,
+            "cc_params_nan":  cc_params_nan,
             "cost_critic_loss": cc_m["cost_critic_loss"],
             "mean_step_cost":   cc_m["mean_step_cost"],
             "mean_d_wall":      cc_m["mean_d_wall"],
@@ -1313,6 +1379,18 @@ def main(args: Args):
             "sa_norm_min_actor":  float(jnp.min(epoch_metrics["sa_norm_min_actor"])),
             "g_norm_min_actor":   float(jnp.min(epoch_metrics["g_norm_min_actor"])),
             "action_max_actor":   float(jnp.max(epoch_metrics["action_max_actor"])),
+            # Phase-1f grad/param NaN-forensics — max over grad-steps so a
+            # single NaN flips the flag; max over grad norms so runaway
+            # spikes show up even if mean is finite.
+            "c_grad_nan":     float(jnp.max(epoch_metrics["c_grad_nan"])),
+            "c_grad_norm":    float(jnp.max(epoch_metrics["c_grad_norm"])),
+            "c_params_nan":   float(jnp.max(epoch_metrics["c_params_nan"])),
+            "a_grad_nan":     float(jnp.max(epoch_metrics["a_grad_nan"])),
+            "a_grad_norm":    float(jnp.max(epoch_metrics["a_grad_norm"])),
+            "a_params_nan":   float(jnp.max(epoch_metrics["a_params_nan"])),
+            "cc_grad_nan":    float(jnp.max(epoch_metrics["cc_grad_nan"])),
+            "cc_grad_norm":   float(jnp.max(epoch_metrics["cc_grad_norm"])),
+            "cc_params_nan":  float(jnp.max(epoch_metrics["cc_params_nan"])),
             **eval_metrics,
         }
 
@@ -1363,6 +1441,23 @@ def main(args: Args):
             f"‖φ‖min_a={log_dict['sa_norm_min_actor']:.3f} "
             f"‖ψ‖min_a={log_dict['g_norm_min_actor']:.3f} "
             f"|a|max={log_dict['action_max_actor']:.3f}"
+        )
+        # Phase-1f grad/param NaN one-liner. Reading order at first epoch:
+        #   if all *_grad_nan = 0 and *_params_nan = 0 but forward NaN flags
+        #   were set, the corruption came in via the buffer (next rollout
+        #   reads NaN params or NaN obs).  If c_grad_nan = 1 first, NaN
+        #   originates in the autograd path of the critic loss.  Norms in
+        #   scientific notation so blowups remain readable.
+        print(
+            f"         grad[c={log_dict['c_grad_nan']:.0f}/"
+            f"{log_dict['c_grad_norm']:.2e} "
+            f"a={log_dict['a_grad_nan']:.0f}/"
+            f"{log_dict['a_grad_norm']:.2e} "
+            f"cc={log_dict['cc_grad_nan']:.0f}/"
+            f"{log_dict['cc_grad_norm']:.2e}] "
+            f"params[c={log_dict['c_params_nan']:.0f} "
+            f"a={log_dict['a_params_nan']:.0f} "
+            f"cc={log_dict['cc_params_nan']:.0f}]"
         )
 
         if args.track:
