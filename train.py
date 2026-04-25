@@ -632,8 +632,25 @@ def main(args: Args):
         sa_norm_min_c = jnp.min(jnp.linalg.norm(sa_repr, axis=-1))
         g_norm_min_c  = jnp.min(jnp.linalg.norm(g_repr,  axis=-1))
 
-        sa_repr = sa_repr / (jnp.linalg.norm(sa_repr, axis=-1, keepdims=True) + 1e-8)
-        g_repr  = g_repr  / (jnp.linalg.norm(g_repr,  axis=-1, keepdims=True) + 1e-8)
+        # Phase-1f NaN-fix.  Original form was
+        #     sa_repr / (jnp.linalg.norm(sa_repr, axis=-1) + 1e-8)
+        # which is forward-finite (divisor ≥ 1e-8) but autograd-NaN whenever
+        # sum(sa²) underflows to 0.  jnp.linalg.norm internally computes
+        # sqrt(sum(x²)); JAX's gradient of sqrt(s) is 1/(2·sqrt(s)), so at
+        # s = 0 the backward returns +inf, and inf · 0 from the chain rule
+        # produces NaN even though the forward divisor is 1e-8.  Putting
+        # the epsilon INSIDE the sqrt makes the radicand strictly positive,
+        # so both forward and backward are finite.  Job 988003 epoch-1
+        # forensics: critic forward finite, c_grad_nan first at flat=0 —
+        # the textbook signature of this autograd singularity.
+        sa_norm_safe = jnp.sqrt(
+            jnp.sum(sa_repr * sa_repr, axis=-1, keepdims=True) + 1e-12
+        )
+        g_norm_safe  = jnp.sqrt(
+            jnp.sum(g_repr  * g_repr,  axis=-1, keepdims=True) + 1e-12
+        )
+        sa_repr = sa_repr / sa_norm_safe
+        g_repr  = g_repr  / g_norm_safe
         logits = jnp.einsum("ik,jk->ij", sa_repr, g_repr) / args.tau
         logits_has_nan_c = jnp.any(jnp.isnan(logits)).astype(jnp.float32)
         logsumexp_val = jax.nn.logsumexp(logits, axis=1)
@@ -699,8 +716,18 @@ def main(args: Args):
         sa_norm_min_a    = jnp.min(jnp.linalg.norm(sa_repr, axis=-1))
         g_norm_min_a     = jnp.min(jnp.linalg.norm(g_repr,  axis=-1))
 
-        sa_repr = sa_repr / (jnp.linalg.norm(sa_repr, axis=-1, keepdims=True) + 1e-8)
-        g_repr  = g_repr  / (jnp.linalg.norm(g_repr,  axis=-1, keepdims=True) + 1e-8)
+        # Phase-1f NaN-fix (actor side, identical reasoning to the critic
+        # side above). Move epsilon inside sqrt so the radicand is always
+        # strictly positive; otherwise grad of sqrt(0) = +inf and chain
+        # rule produces NaN gradients despite finite forward.
+        sa_norm_safe = jnp.sqrt(
+            jnp.sum(sa_repr * sa_repr, axis=-1, keepdims=True) + 1e-12
+        )
+        g_norm_safe  = jnp.sqrt(
+            jnp.sum(g_repr  * g_repr,  axis=-1, keepdims=True) + 1e-12
+        )
+        sa_repr = sa_repr / sa_norm_safe
+        g_repr  = g_repr  / g_norm_safe
         f_sa_g  = jnp.sum(sa_repr * g_repr, axis=-1) / args.tau
         f_has_nan_a = jnp.any(jnp.isnan(f_sa_g)).astype(jnp.float32)
 

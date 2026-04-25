@@ -102,13 +102,35 @@ assert "nu_f: float = 1.0" in src, \
 assert "tau: float = 0.1" in src, \
     "args.tau default is not 0.1"
 
-# --- Phase-1f base row-L2 (still required; the probes don't remove it) -------
+# --- Phase-1f base row-L2 with autograd-safe sqrt (NEW: epsilon INSIDE sqrt) -
+# Original form was sa_repr / (jnp.linalg.norm(sa_repr) + 1e-8). That form is
+# forward-finite but autograd-NaN whenever sum(sa²) underflows to 0, because
+# JAX's gradient of sqrt(s) at s=0 is +inf. Fix: compute the norm as
+# sqrt(sum(x²) + 1e-12) so the radicand is strictly positive. Job 988003
+# epoch-1 forensics ⇒ critic forward finite at sgd=0, c_grad_nan = 1 at
+# sgd=0 — exact textbook signature of this autograd singularity.
 assert src.count(
-    "sa_repr = sa_repr / (jnp.linalg.norm(sa_repr, axis=-1, keepdims=True) + 1e-8)"
-) == 2, "row-L2 normalize of sa_repr must appear in BOTH critic_loss_fn and actor_loss_fn"
+    "sa_norm_safe = jnp.sqrt("
+) == 2, "autograd-safe row-L2 (sa_norm_safe = sqrt(sum + eps)) must appear in BOTH losses"
 assert src.count(
-    "g_repr  = g_repr  / (jnp.linalg.norm(g_repr,  axis=-1, keepdims=True) + 1e-8)"
-) == 2, "row-L2 normalize of g_repr must appear in BOTH critic_loss_fn and actor_loss_fn"
+    "g_norm_safe  = jnp.sqrt("
+) == 2, "autograd-safe row-L2 (g_norm_safe = sqrt(sum + eps)) must appear in BOTH losses"
+assert src.count(
+    "jnp.sum(sa_repr * sa_repr, axis=-1, keepdims=True) + 1e-12"
+) == 2, "sa_repr safe-norm radicand (sum(sa²)+1e-12) must appear in both losses"
+assert src.count(
+    "jnp.sum(g_repr  * g_repr,  axis=-1, keepdims=True) + 1e-12"
+) == 2, "g_repr safe-norm radicand (sum(g²)+1e-12) must appear in both losses"
+assert src.count("sa_repr = sa_repr / sa_norm_safe") == 2, \
+    "sa_repr divide-by-safe-norm must appear in both losses"
+assert src.count("g_repr  = g_repr  / g_norm_safe")  == 2, \
+    "g_repr divide-by-safe-norm must appear in both losses"
+# Belt-and-suspenders: the OLD unsafe form must NOT survive anywhere, else
+# we have a partial fix and the autograd-NaN singularity would re-fire.
+assert "jnp.linalg.norm(sa_repr, axis=-1, keepdims=True) + 1e-8" not in src, \
+    "stale unsafe row-L2 form on sa_repr still present — fix did not land"
+assert "jnp.linalg.norm(g_repr,  axis=-1, keepdims=True) + 1e-8" not in src, \
+    "stale unsafe row-L2 form on g_repr still present — fix did not land"
 assert 'jnp.einsum("ik,jk->ij", sa_repr, g_repr) / args.tau' in src, \
     "critic InfoNCE logits must be divided by args.tau"
 assert "f_sa_g  = jnp.sum(sa_repr * g_repr, axis=-1) / args.tau" in src, \
