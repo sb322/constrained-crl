@@ -732,6 +732,53 @@ def main(args: Args):
         f_has_nan_a = jnp.any(jnp.isnan(f_sa_g)).astype(jnp.float32)
 
         alpha = jnp.exp(log_alpha)
+
+        # Phase-1g actor-loss component forensics. After job 990871, the
+        # 50-epoch Phase-1f run with row-L2 + τ=0.1 produced a_loss = −484K
+        # despite all NaN flags clean and f_sa_g ∈ [−10, 10] by Cauchy-Schwarz
+        # on the unit sphere. Since
+        #     a_loss = α·mean(log_prob) − mean(f_sa_g)/ν_f
+        # and the second term is bounded by 10/ν_f, the −484K must originate
+        # in α·mean(log_prob). These probes split that into its causal pieces:
+        #
+        #   alpha_metric    : α = exp(log_α). If α ≫ 1 and grows monotonically,
+        #                     the SAC entropy temperature is unbounded above —
+        #                     symptom of entropy-target chasing.
+        #   log_prob_mean   : mean(log_prob) = mean(Gaussian logpdf − tanh-sat).
+        #                     If hugely positive, distribution is concentrated
+        #                     (low entropy, σ small or saturating actions).
+        #                     If hugely negative, distribution is spread out
+        #                     and α·log_prob can blow up negative.
+        #   alpha_logprob   : α·mean(log_prob). The dominant term in a_loss.
+        #                     Direct read on whether this is the divergent term.
+        #   gaussian_logp_mean: mean(Gaussian logpdf only, before tanh corr).
+        #                     Splits log_prob into its two contributions.
+        #   sat_correction_mean: mean(−log((1−a²)+1e-6)) summed over action dims.
+        #                     With |a|=1, each dim contributes +log(1e6) ≈ +13.8;
+        #                     summed over 8 ant action dims → +110. If this
+        #                     term dominates log_prob, tanh-saturation is the
+        #                     direct driver of α·log_prob magnitude.
+        #   log_std_mean    : mean(log σ). Lower-clipped at −5 (σ≈0.0067), upper
+        #                     at +2 (σ≈7.4). If pinned to the lower clip, policy
+        #                     has collapsed to a near-deterministic peak.
+        #   f_term_mean     : mean(f_sa_g)/ν_f. Should stay bounded by 10 under
+        #                     the row-L2 contract.  Probe so we can confirm.
+        sat_correction_per_dim = jnp.log((1 - jnp.square(action)) + 1e-6)
+        # gaussian_logp_per_dim is the un-corrected Gaussian density log,
+        # before subtracting the tanh-Jacobian. summed over action dims.
+        gaussian_logp_full = jax.scipy.stats.norm.logpdf(
+            x_ts, loc=means, scale=stds
+        ).sum(-1)
+        sat_correction_full = sat_correction_per_dim.sum(-1)
+
+        alpha_metric        = alpha
+        log_prob_mean       = jnp.mean(log_prob)
+        alpha_logprob_mean  = alpha * log_prob_mean
+        gaussian_logp_mean  = jnp.mean(gaussian_logp_full)
+        sat_correction_mean = jnp.mean(sat_correction_full)
+        log_std_mean        = jnp.mean(log_stds)
+        f_term_mean         = jnp.mean(f_sa_g) / args.nu_f
+
         # Preconditioned: divide f by ν_f to normalize InfoNCE scale
         actor_loss = jnp.mean(alpha * log_prob - f_sa_g / args.nu_f)
 
@@ -746,7 +793,10 @@ def main(args: Args):
                             sa_repr_norm_actor, g_repr_norm_actor,
                             sa_has_nan_a, g_has_nan_a,
                             sa_norm_min_a, g_norm_min_a,
-                            action_has_nan_a, action_max_a, f_has_nan_a)
+                            action_has_nan_a, action_max_a, f_has_nan_a,
+                            alpha_metric, log_prob_mean, alpha_logprob_mean,
+                            gaussian_logp_mean, sat_correction_mean,
+                            log_std_mean, f_term_mean)
 
     def alpha_loss_fn(log_alpha, log_prob):
         return -jnp.mean(log_alpha * (log_prob + action_size))
@@ -915,7 +965,10 @@ def main(args: Args):
         #        action_nan_a, action_max_a, f_nan_a)
         (a_loss, (log_prob, mean_qc_pi, sa_rn_act, g_rn_act,
                   sa_nan_a, g_nan_a, sa_nmin_a, g_nmin_a,
-                  action_nan_a, action_max_a, f_nan_a)), a_grads = \
+                  action_nan_a, action_max_a, f_nan_a,
+                  alpha_metric_a, log_prob_mean_a, alpha_logprob_mean_a,
+                  gaussian_logp_mean_a, sat_correction_mean_a,
+                  log_std_mean_a, f_term_mean_a)), a_grads = \
             jax.value_and_grad(actor_loss_fn, has_aux=True)(
             training_state.actor_state.params,
             critic_state.params,
@@ -1097,6 +1150,18 @@ def main(args: Args):
             "cc_grad_nan":    cc_grad_nan,
             "cc_grad_norm":   cc_grad_norm,
             "cc_params_nan":  cc_params_nan,
+            # Phase-1g actor-loss component forensics. Each is a per-sgd-step
+            # mean. Reading these together at epoch 1 vs epoch 50 of a run
+            # whose actor_loss diverges to −484K decomposes the divergence
+            # into a definite causal source (entropy temperature α, policy
+            # log-density, tanh-saturation Jacobian, or Gaussian density).
+            "alpha_actor":           alpha_metric_a,
+            "log_prob_mean_actor":   log_prob_mean_a,
+            "alpha_logprob_actor":   alpha_logprob_mean_a,
+            "gaussian_logp_actor":   gaussian_logp_mean_a,
+            "sat_correction_actor":  sat_correction_mean_a,
+            "log_std_mean_actor":    log_std_mean_a,
+            "f_term_mean_actor":     f_term_mean_a,
             "cost_critic_loss": cc_m["cost_critic_loss"],
             "mean_step_cost":   cc_m["mean_step_cost"],
             "mean_d_wall":      cc_m["mean_d_wall"],
@@ -1505,6 +1570,17 @@ def main(args: Args):
             "cc_grad_nan":    float(jnp.max(epoch_metrics["cc_grad_nan"])),
             "cc_grad_norm":   float(jnp.max(epoch_metrics["cc_grad_norm"])),
             "cc_params_nan":  float(jnp.max(epoch_metrics["cc_params_nan"])),
+            # Phase-1g actor-loss component forensics — mean across all sgd-
+            # steps in the epoch. None of these are flag-like, so use mean
+            # not max. abs-max useful for log_prob_mean/alpha_logprob since
+            # they can be large negative or positive.
+            "alpha_actor":          float(jnp.mean(epoch_metrics["alpha_actor"])),
+            "log_prob_mean_actor":  float(jnp.mean(epoch_metrics["log_prob_mean_actor"])),
+            "alpha_logprob_actor":  float(jnp.mean(epoch_metrics["alpha_logprob_actor"])),
+            "gaussian_logp_actor":  float(jnp.mean(epoch_metrics["gaussian_logp_actor"])),
+            "sat_correction_actor": float(jnp.mean(epoch_metrics["sat_correction_actor"])),
+            "log_std_mean_actor":   float(jnp.mean(epoch_metrics["log_std_mean_actor"])),
+            "f_term_mean_actor":    float(jnp.mean(epoch_metrics["f_term_mean_actor"])),
             **eval_metrics,
         }
 
@@ -1572,6 +1648,27 @@ def main(args: Args):
             f"params[c={log_dict['c_params_nan']:.0f} "
             f"a={log_dict['a_params_nan']:.0f} "
             f"cc={log_dict['cc_params_nan']:.0f}]"
+        )
+        # Phase-1g actor-loss component one-liner. Reading order:
+        #   a_loss should equal α·log_p − f_term within rounding (no λ̃ at d=0.15)
+        #     i.e., log_dict['actor_loss'] ≈ alpha_logprob_actor − f_term_mean_actor.
+        #   If α grows monotonically and α·log_p stays large negative → SAC
+        #     entropy temperature is unbounded; fix is to clip α or constrain it.
+        #   If sat_corr_a is large positive (→ +110 = 8 dim × +13.8 at saturation),
+        #     and Gaussian_lp_a is small, the tanh-saturation Jacobian dominates
+        #     log_prob; fix is numerically-stable softplus form or action smoothing.
+        #   If log_std_a → −5 (lower clip, σ ≈ 0.0067), policy has collapsed to
+        #     a near-deterministic peak; entropy collapse is the source.
+        #   If f_term_a |·| > 10 despite row-L2, the row-L2 contract is broken
+        #     somewhere. Should never happen.
+        print(
+            f"         actor[α={log_dict['alpha_actor']:.4g} "
+            f"log_p={log_dict['log_prob_mean_actor']:.3g} "
+            f"α·log_p={log_dict['alpha_logprob_actor']:.3g} "
+            f"gauss_lp={log_dict['gaussian_logp_actor']:.3g} "
+            f"sat_corr={log_dict['sat_correction_actor']:.3g} "
+            f"log_std={log_dict['log_std_mean_actor']:.3g} "
+            f"f_term={log_dict['f_term_mean_actor']:.3g}]"
         )
 
         if args.track:

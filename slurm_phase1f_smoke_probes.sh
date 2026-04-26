@@ -10,37 +10,55 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --gres=gpu:a100_40g:1
 #SBATCH --mem=32G
-#SBATCH --time=01:00:00
-# ── Phase-1f NaN forensics (probed re-run).
-#    Same config as slurm_phase1f_smoke_tau1p0.sh: τ=1.0, 3 epochs, 300K steps.
-#    New payload: train.py now emits per-epoch NaN-flag probes (obs/sa/g
-#    NaN in the critic pass; sa/g/action/f NaN in the actor pass; pre-norm
-#    minima ‖φ‖min, ‖ψ‖min; max absolute action). Purpose is to localize
-#    the NaN origin that the prior tau=1.0 smoke established is NOT
-#    τ-amplified gradient blow-up (τ=0.1 and τ=1.0 produced identical
-#    step-1 NaN signatures, so the driver is upstream of the InfoNCE
-#    division).
+#SBATCH --time=04:00:00
+# ── Phase-1g actor-loss component forensics (PRODUCTION-knobs smoke).
+#    Knobs match production: τ=0.1, 15 epochs, 1.5M env steps. Reuses the
+#    `phase1f_smoke_probes` job name and output filenames so existing
+#    diagnostic-pull scripts continue to work, but the EXPERIMENTAL
+#    QUESTION has changed since the NaN cascade was closed by the
+#    autograd-safe row-L2 fix.
 #
-#  Expected routing from the one-liner probe print at epoch 1:
-#    obs_nan_c=1          → buffer contamination (env emitted NaN)
-#    sa_nan_c=1/g_nan_c=1 → encoder forward NaN on finite input
-#    *_norm_min ≈ 0       → row-L2 divides by +1e-8 on a zero-length vector
-#    logits_nan_c=1 alone → cosine / τ pathology despite finite φ̂, ψ̂
-#    action_nan_a=1       → actor produces NaN action at step 0/1
-#    |a|max_a > 1 + ε     → tanh-saturation precursor
+#    Question this run answers:
+#       Phase-1f at d=0.15 (job 990871, 50 epochs) ran with no NaN but
+#       a_loss = −484K by epoch 50. Since
+#           a_loss = α·mean(log_p) − mean(f_sa_g)/ν_f
+#       and mean(f_sa_g)/ν_f ≤ 10/ν_f under row-L2, the −484K must
+#       originate in α·mean(log_p). NEW probes split this into:
+#         alpha       = α = exp(log_α)             unbounded above?
+#         log_p       = mean(log_prob)             distribution density
+#         α·log_p     = product                    direct read on driver
+#         gauss_lp    = mean(Gaussian logpdf)      Gaussian density only
+#         sat_corr    = mean(−Σ log((1−a²)+1e-6))  tanh-Jacobian term
+#         log_std     = mean(log σ)                policy concentration
+#         f_term      = mean(f_sa_g)/ν_f           reward-critic term
+#       (sum-decomposes log_p = gauss_lp + sat_corr).
 #
-#  No causal knob is changed relative to the prior smoke — this is pure
-#  observability. The run MUST NaN identically to slurm_phase1f_smoke_tau1p0
-#  (job 981715). If it NaNs differently, the patch introduced a bug.
+#    Expected behavior at 15 epochs (extrapolating the production trajectory
+#    a_loss[1]=+1, a_loss[5]=−10.8, a_loss[15]≈ −80 to −300):
+#       • |a_loss| should be in the range [50, 500].
+#       • Components should make exactly one of the four candidate sources
+#         dominant by epoch 15. Read the third per-epoch print line
+#         (`actor[α=… log_p=… α·log_p=… gauss_lp=… sat_corr=… …]`) and
+#         flag the term whose magnitude tracks a_loss.
+#
+#    Wallclock budget: 15 epochs at ~13 min/epoch (production rate) + JIT
+#    cache warmup ≈ 4 h. Walltime set to 04:00:00 with safety margin.
+#
+#    No causal knob changed in train.py losses, optimizer, or environment.
+#    The only changes vs job 990871 are (a) duration shortened from 50→15
+#    epochs and (b) the actor-loss component probes added.
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  PHASE-1f PROBED SMOKE — NaN forensics on τ=1.0 config.
-#  Context. Two prior smokes (tau=0.1 full at job 980196 over 20/50 epochs,
-#  tau=1.0 smoke at job 981715 over 3/3 epochs) both produced:
-#       c_loss = NaN from epoch 1
-#       acc = 0.00391 = 1/256          (argmax over NaN logits → always 0)
-#       a_loss = NaN, cost = NaN, hard_viol = 0 (NaN < ε returns False)
-#  This run is one commit of new diagnostics on top; no causal knob changed.
+#  PHASE-1g ACTOR-LOSS COMPONENT FORENSICS (production-knobs smoke).
+#  Context. Job 990871 (Phase-1f, 50 epochs, d=0.15) showed a_loss diverged
+#  to −484K despite zero NaN, with all forward NaN flags clean and row-L2 +
+#  τ=0.1 holding. The Cauchy-Schwarz bound on f_sa_g rules out the
+#  reward-critic term as the source, so the divergence is in α·log_p.
+#  This run instruments the components to identify which sub-term carries
+#  the magnitude — α, log_p, the Gaussian piece, the tanh-saturation piece,
+#  or log σ. The result determines the Phase-2 fix surface (clip α, switch
+#  to numerically-stable softplus tanh-Jacobian, smooth actions, or constrain
+#  σ from below differently).
 # ═════════════════════════════════════════════════════════════════════════════
 
 module purge
@@ -332,7 +350,78 @@ for query, where in [
 assert '"c_grad_norm",   "c_grad_norm"' in src, \
     "epoch-1 forensics grad_norm head dump missing"
 
-print("Phase-1f base fix + forward NaN probes + prefill probe + grad/param NaN probes + epoch-1 time-series dump verified in train.py.")
+# 10. Phase-1g actor-loss component forensics. Job 990871 confirmed
+#     a_loss = −484K with no NaN and row-L2 holding f_sa_g ∈ [−10, 10].
+#     The −484K must originate in α·mean(log_p). These probes split that
+#     into α, log_p, the Gaussian piece, the tanh-saturation piece, and
+#     log σ. The smoke runs 15 epochs at production τ=0.1; even if a_loss
+#     hasn't reached −484K by epoch 15, the relative magnitudes of the
+#     components identify the divergent term unambiguously.
+
+# 10a. Probe definitions inside actor_loss_fn
+for probe, where in [
+    ("sat_correction_per_dim = jnp.log((1 - jnp.square(action)) + 1e-6)",
+     "saturation-correction per-dim probe"),
+    ("gaussian_logp_full = jax.scipy.stats.norm.logpdf(",
+     "Gaussian logpdf full probe"),
+    ("alpha_metric        = alpha",
+     "alpha probe"),
+    ("log_prob_mean       = jnp.mean(log_prob)",
+     "mean(log_prob) probe"),
+    ("alpha_logprob_mean  = alpha * log_prob_mean",
+     "α·log_prob probe"),
+    ("gaussian_logp_mean  = jnp.mean(gaussian_logp_full)",
+     "mean Gaussian logpdf probe"),
+    ("sat_correction_mean = jnp.mean(sat_correction_full)",
+     "mean saturation correction probe"),
+    ("log_std_mean        = jnp.mean(log_stds)",
+     "mean log_std probe"),
+    ("f_term_mean         = jnp.mean(f_sa_g) / args.nu_f",
+     "f_term mean probe"),
+]:
+    assert probe in src, f"actor-loss component probe missing — {where}"
+
+# 10b. Aux tuple extension
+assert ("alpha_metric, log_prob_mean, alpha_logprob_mean,\n"
+        "                            gaussian_logp_mean, sat_correction_mean,\n"
+        "                            log_std_mean, f_term_mean)") in src, \
+    "actor_loss_fn aux return missing the 7 new component probes"
+
+# 10c. Call-site unpacking
+assert ("alpha_metric_a, log_prob_mean_a, alpha_logprob_mean_a,\n"
+        "                  gaussian_logp_mean_a, sat_correction_mean_a,\n"
+        "                  log_std_mean_a, f_term_mean_a)") in src, \
+    "actor_loss_fn call site does not unpack the 7 new component probes"
+
+# 10d. Metrics dict keys
+for k in [
+    '"alpha_actor":           alpha_metric_a,',
+    '"log_prob_mean_actor":   log_prob_mean_a,',
+    '"alpha_logprob_actor":   alpha_logprob_mean_a,',
+    '"gaussian_logp_actor":   gaussian_logp_mean_a,',
+    '"sat_correction_actor":  sat_correction_mean_a,',
+    '"log_std_mean_actor":    log_std_mean_a,',
+    '"f_term_mean_actor":     f_term_mean_a,',
+]:
+    assert k in src, f"metrics dict missing actor component — {k}"
+
+# 10e. log_dict aggregation (mean)
+for k in [
+    '"alpha_actor":          float(jnp.mean(epoch_metrics["alpha_actor"])),',
+    '"log_prob_mean_actor":  float(jnp.mean(epoch_metrics["log_prob_mean_actor"])),',
+    '"alpha_logprob_actor":  float(jnp.mean(epoch_metrics["alpha_logprob_actor"])),',
+    '"gaussian_logp_actor":  float(jnp.mean(epoch_metrics["gaussian_logp_actor"])),',
+    '"sat_correction_actor": float(jnp.mean(epoch_metrics["sat_correction_actor"])),',
+    '"log_std_mean_actor":   float(jnp.mean(epoch_metrics["log_std_mean_actor"])),',
+    '"f_term_mean_actor":    float(jnp.mean(epoch_metrics["f_term_mean_actor"])),',
+]:
+    assert k in src, f"log_dict missing actor component aggregation — {k}"
+
+# 10f. Per-epoch actor-component print line
+assert "f\"         actor[α=" in src, \
+    "per-epoch actor-component print line missing from training loop"
+
+print("Phase-1f base fix + forward NaN probes + prefill probe + grad/param NaN probes + epoch-1 time-series dump + actor-component probes verified in train.py.")
 PYCHECK
 
 if [ $? -ne 0 ]; then
@@ -385,16 +474,17 @@ PYCHECK
 echo ""
 echo "===== PHASE-1f PROBED SMOKE LAUNCH  $(date) ====="
 
-# τ=1.0 matches slurm_phase1f_smoke_tau1p0.sh exactly. The new payload is the
-# probe instrumentation inside train.py, not any CLI knob. 3 epochs, ~40 min.
+# Production knobs (τ=0.1 default, depth=4 everywhere, batch=256, etc.).
+# Only changes vs job 990871 are duration: 15 epochs / 1.5M env steps.
+# τ is NOT overridden — we want the production τ=0.1 default to drive the
+# same divergence we observed at scale.
 
 "$PYTHON" train.py \
     --env_id            ant_big_maze \
     --eval_env_id       ant_big_maze_eval \
     --episode_length    1000 \
-    --total_env_steps   300000 \
-    --num_epochs        3 \
-    --tau               1.0 \
+    --total_env_steps   1500000 \
+    --num_epochs        15 \
     --num_envs          256 \
     --eval_envs         32 \
     --eval_every        5 \
@@ -425,10 +515,10 @@ echo "===== PHASE-1f PROBED SMOKE LAUNCH  $(date) ====="
     --pid_kd            0.001 \
     --lambda_max        100.0 \
     --wandb_project     constrained-crl \
-    --wandb_group       phase1f_smoke_probes \
+    --wandb_group       phase1g_actor_components \
     --track             True
 
 EXIT_CODE=$?
 echo ""
-echo "===== PHASE-1f PROBED SMOKE DONE  $(date)  exit=$EXIT_CODE ====="
+echo "===== PHASE-1g ACTOR-COMPONENT SMOKE DONE  $(date)  exit=$EXIT_CODE ====="
 exit $EXIT_CODE
