@@ -193,8 +193,11 @@ assert ("sa_has_nan_c, g_has_nan_c, obs_has_nan_c,\n"
     "critic_loss_fn aux return is missing the 6 probe scalars"
 assert ("sa_has_nan_a, g_has_nan_a,\n"
         "                            sa_norm_min_a, g_norm_min_a,\n"
-        "                            action_has_nan_a, action_max_a, f_has_nan_a)") in src, \
-    "actor_loss_fn aux return is missing the 7 probe scalars"
+        "                            action_has_nan_a, action_max_a, f_has_nan_a,") in src, \
+    ("actor_loss_fn aux return is missing the 7 NaN-forensics probe scalars "
+     "(NB: the closing `)` moved when Phase-1g added the 7 actor-component "
+     "probes after f_has_nan_a; this assert now matches `f_has_nan_a,` "
+     "since more probes follow on the next lines).")
 
 # 4. Call-site unpacking
 assert ("(c_loss, (lp, ln, acc, lse, sa_rn_crit, g_rn_crit,\n"
