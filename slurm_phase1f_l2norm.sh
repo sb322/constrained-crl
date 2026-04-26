@@ -235,6 +235,24 @@ assert "[prefill probe] buffer NaN anywhere:" in src, \
 assert "[epoch1 forensics]" in src, \
     "epoch-1 time-series dump missing — probes were stripped"
 
+# Phase-1g α-cap. Smoke job 1001824 confirmed actor_loss bounded at −1.19
+# under α_max=1.0 (vs −148 in the equivalent run without cap). The cap is
+# the only thing standing between this 50-epoch run and the −484K
+# divergence we observed in Phase-1f without it. ALL THREE asserts must
+# hold or the run is meaningless.
+assert "alpha_max: float = 1.0" in src, \
+    "Args.alpha_max field missing or default changed — α-cap not wired"
+assert "log_alpha_cap = jnp.log(jnp.maximum(args.alpha_max, 1e-12))" in src, \
+    "α-cap clip computation missing from sgd_step"
+assert "alpha_state = alpha_state.replace(params=clipped_log_alpha)" in src, \
+    "α-cap clip not applied to alpha_state — divergence will recur"
+# Actor-loss component probes (so we can monitor at scale that the cap is
+# binding and α isn't drifting due to a fp64/fp32 boundary issue).
+assert "f\"         actor[α=" in src, \
+    "actor-component per-epoch one-liner missing"
+assert "α_clip={log_dict['alpha_clip_active']:.2f}" in src, \
+    "α_clip token missing from actor-component print line"
+
 # The broken Phase-1d claim must be gone
 assert "LayerNorm inside the encoders anchors" not in src, \
     "the false 'LayerNorm anchors ‖φ‖,‖ψ‖' comment from Option-A is still in train.py"
