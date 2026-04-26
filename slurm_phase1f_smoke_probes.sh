@@ -206,8 +206,11 @@ assert ("(c_loss, (lp, ln, acc, lse, sa_rn_crit, g_rn_crit,\n"
     "critic_loss_fn call site does not unpack the 6 new probe scalars"
 assert ("(a_loss, (log_prob, mean_qc_pi, sa_rn_act, g_rn_act,\n"
         "                  sa_nan_a, g_nan_a, sa_nmin_a, g_nmin_a,\n"
-        "                  action_nan_a, action_max_a, f_nan_a))") in src, \
-    "actor_loss_fn call site does not unpack the 7 new probe scalars"
+        "                  action_nan_a, action_max_a, f_nan_a,") in src, \
+    ("actor_loss_fn call site does not unpack the 7 NaN-forensics probe "
+     "scalars (NB: closing `))` moved when Phase-1g added the 7 actor-"
+     "component probes after f_nan_a; this assert now matches `f_nan_a,` "
+     "since more unpack tokens follow on the next lines).")
 
 # 5. Metrics dict keys
 for key, where in [
