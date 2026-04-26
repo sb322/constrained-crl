@@ -64,6 +64,17 @@ class Args:
     actor_lr: float = 3e-4
     critic_lr: float = 3e-4
     alpha_lr: float = 3e-4
+    # Phase-1g alpha cap. Job 994166 forensics decomposed actor_loss = α·log_p −
+    # f_term and showed every component except α is stationary across 15 epochs
+    # at production τ=0.1: α grows ~26%/epoch (1.12 → 27.9), pushing actor_loss
+    # from +1.1 to −148. Extrapolated to 50 epochs: α≈97k, actor_loss≈−530k.
+    # Mechanism: target_entropy = −action_size = −8 is unreachable for the
+    # tanh-Gaussian under contrastive shaping (achievable entropy ≈ +5.5 nats
+    # vs. target +8), so the auto-α update has no equilibrium and α grows
+    # unboundedly. Default cap 1.0 caps actor_loss at ≈ |1·log_p − f_term| ≈ 1.
+    # Auto-α still adapts in [0, α_max]; the cap only forecloses the
+    # unbounded-divergence mode.
+    alpha_max: float = 1.0
     gamma: float = 0.99
     logsumexp_penalty_coeff: float = 0.1
     critic_network_width: int = 256
@@ -988,6 +999,17 @@ def main(args: Args):
         al_loss, al_grads = jax.value_and_grad(alpha_loss_fn)(
             training_state.alpha_state.params, log_prob)
         alpha_state = training_state.alpha_state.apply_gradients(grads=al_grads)
+        # Phase-1g α-cap. Job 994166 forensics confirmed actor_loss diverges
+        # purely via α (every other actor-loss component is stationary). Cap
+        # log_alpha at log(args.alpha_max) so α ∈ [0, alpha_max]. The auto-α
+        # update remains active inside that range; we only foreclose the
+        # unbounded-divergence mode where target_entropy is unreachable.
+        # alpha_clip_active = 1 if the cap binds this step; useful diagnostic
+        # for whether auto-α is naturally below the cap or pinned to it.
+        log_alpha_cap = jnp.log(jnp.maximum(args.alpha_max, 1e-12))
+        clipped_log_alpha = jnp.minimum(alpha_state.params, log_alpha_cap)
+        alpha_clip_active = (alpha_state.params > log_alpha_cap).astype(jnp.float32)
+        alpha_state = alpha_state.replace(params=clipped_log_alpha)
 
         # ── Cost critic + PID dual update ─────────────────────
         if args.use_constraints:
@@ -1162,6 +1184,9 @@ def main(args: Args):
             "sat_correction_actor":  sat_correction_mean_a,
             "log_std_mean_actor":    log_std_mean_a,
             "f_term_mean_actor":     f_term_mean_a,
+            # Phase-1g α-cap diagnostic. 1.0 means the cap bound this step
+            # (auto-α wanted to push α above alpha_max but was clipped).
+            "alpha_clip_active":     alpha_clip_active,
             "cost_critic_loss": cc_m["cost_critic_loss"],
             "mean_step_cost":   cc_m["mean_step_cost"],
             "mean_d_wall":      cc_m["mean_d_wall"],
@@ -1581,6 +1606,11 @@ def main(args: Args):
             "sat_correction_actor": float(jnp.mean(epoch_metrics["sat_correction_actor"])),
             "log_std_mean_actor":   float(jnp.mean(epoch_metrics["log_std_mean_actor"])),
             "f_term_mean_actor":    float(jnp.mean(epoch_metrics["f_term_mean_actor"])),
+            # Phase-1g α-cap binding rate. mean over sgd-steps gives fraction
+            # of steps where the cap was active. 0.0 = auto-α naturally below
+            # cap (α_max chosen too loose); 1.0 = always clipped (auto-α wants
+            # higher α than the cap allows — expected once α_max < equilibrium).
+            "alpha_clip_active":    float(jnp.mean(epoch_metrics["alpha_clip_active"])),
             **eval_metrics,
         }
 
@@ -1668,7 +1698,8 @@ def main(args: Args):
             f"gauss_lp={log_dict['gaussian_logp_actor']:.3g} "
             f"sat_corr={log_dict['sat_correction_actor']:.3g} "
             f"log_std={log_dict['log_std_mean_actor']:.3g} "
-            f"f_term={log_dict['f_term_mean_actor']:.3g}]"
+            f"f_term={log_dict['f_term_mean_actor']:.3g} "
+            f"α_clip={log_dict['alpha_clip_active']:.2f}]"
         )
 
         if args.track:

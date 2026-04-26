@@ -427,7 +427,35 @@ for k in [
 assert "f\"         actor[α=" in src, \
     "per-epoch actor-component print line missing from training loop"
 
-print("Phase-1f base fix + forward NaN probes + prefill probe + grad/param NaN probes + epoch-1 time-series dump + actor-component probes verified in train.py.")
+# 11. Phase-1g α-cap. Job 994166 forensics established that actor_loss diverges
+#     purely via α growing exponentially; every other component of the actor
+#     loss is stationary across 15 epochs. The cap forecloses the unbounded-
+#     divergence mode by clipping log_alpha at log(args.alpha_max). Auto-α
+#     remains active in [0, alpha_max].
+
+# 11a. Args field
+assert "alpha_max: float = 1.0" in src, \
+    "args.alpha_max field missing or not defaulted to 1.0"
+
+# 11b. Clip computation right after alpha apply_gradients
+for line in [
+    "log_alpha_cap = jnp.log(jnp.maximum(args.alpha_max, 1e-12))",
+    "clipped_log_alpha = jnp.minimum(alpha_state.params, log_alpha_cap)",
+    "alpha_clip_active = (alpha_state.params > log_alpha_cap).astype(jnp.float32)",
+    "alpha_state = alpha_state.replace(params=clipped_log_alpha)",
+]:
+    assert line in src, f"α-cap implementation line missing: {line}"
+
+# 11c. Diagnostic propagation (metrics → log_dict → print)
+assert '"alpha_clip_active":     alpha_clip_active,' in src, \
+    "alpha_clip_active missing from per-step metrics dict"
+assert ('"alpha_clip_active":    '
+        'float(jnp.mean(epoch_metrics["alpha_clip_active"])),') in src, \
+    "alpha_clip_active missing from log_dict"
+assert "α_clip={log_dict['alpha_clip_active']:.2f}" in src, \
+    "α_clip token missing from per-epoch actor-component print line"
+
+print("Phase-1f base fix + forward NaN probes + prefill probe + grad/param NaN probes + epoch-1 time-series dump + actor-component probes + α-cap verified in train.py.")
 PYCHECK
 
 if [ $? -ne 0 ]; then
@@ -521,7 +549,7 @@ echo "===== PHASE-1f PROBED SMOKE LAUNCH  $(date) ====="
     --pid_kd            0.001 \
     --lambda_max        100.0 \
     --wandb_project     constrained-crl \
-    --wandb_group       phase1g_actor_components \
+    --wandb_group       phase1g_alpha_cap_v1 \
     --track             True
 
 EXIT_CODE=$?
