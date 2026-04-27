@@ -193,20 +193,65 @@ for probe, where in [
 ]:
     assert probe in src, f"norm-logging probe missing — {where}"
 
-# Exactly two row-L2 normalizations of sa_repr and two of g_repr
-# (once in critic_loss_fn, once in actor_loss_fn)
+# Phase-1f autograd-safe row-L2 (epsilon INSIDE sqrt, in BOTH losses).
+# Job 988003 forensics confirmed the OLD form (`+ 1e-8` outside the norm)
+# is forward-finite but autograd-NaN on near-zero rows. The fix moves the
+# epsilon inside the sqrt so the radicand is strictly positive. Phase-1e
+# inherits this fix unchanged.
+assert src.count("sa_norm_safe = jnp.sqrt(") == 2, \
+    "autograd-safe sa_norm_safe must appear in BOTH critic_loss_fn and actor_loss_fn"
+assert src.count("g_norm_safe  = jnp.sqrt(") == 2, \
+    "autograd-safe g_norm_safe must appear in BOTH critic_loss_fn and actor_loss_fn"
 assert src.count(
-    "sa_repr = sa_repr / (jnp.linalg.norm(sa_repr, axis=-1, keepdims=True) + 1e-8)"
-) == 2, "row-L2 norm of sa_repr must appear in BOTH critic_loss_fn and actor_loss_fn"
+    "jnp.sum(sa_repr * sa_repr, axis=-1, keepdims=True) + 1e-12"
+) == 2, "sa_repr safe-norm radicand sum(sa²)+1e-12 must appear in both losses"
 assert src.count(
-    "g_repr  = g_repr  / (jnp.linalg.norm(g_repr,  axis=-1, keepdims=True) + 1e-8)"
-) == 2, "row-L2 norm of g_repr must appear in BOTH critic_loss_fn and actor_loss_fn"
+    "jnp.sum(g_repr  * g_repr,  axis=-1, keepdims=True) + 1e-12"
+) == 2, "g_repr safe-norm radicand sum(g²)+1e-12 must appear in both losses"
+assert src.count("sa_repr = sa_repr / sa_norm_safe") == 2, \
+    "sa_repr divide-by-safe-norm must appear in both losses"
+assert src.count("g_repr  = g_repr  / g_norm_safe")  == 2, \
+    "g_repr divide-by-safe-norm must appear in both losses"
+# Stale unsafe form must NOT survive anywhere.
+assert "jnp.linalg.norm(sa_repr, axis=-1, keepdims=True) + 1e-8" not in src, \
+    "stale unsafe row-L2 form on sa_repr still present in train.py"
+assert "jnp.linalg.norm(g_repr,  axis=-1, keepdims=True) + 1e-8" not in src, \
+    "stale unsafe row-L2 form on g_repr still present in train.py"
 
 # Both energies must be divided by args.tau
 assert 'jnp.einsum("ik,jk->ij", sa_repr, g_repr) / args.tau' in src, \
     "critic_loss_fn logits must be divided by args.tau (Phase-1f)"
 assert "f_sa_g  = jnp.sum(sa_repr * g_repr, axis=-1) / args.tau" in src, \
     "actor_loss_fn f_sa_g must be divided by args.tau (Phase-1f)"
+
+# Probes alive (kept for this 50-epoch run; per Phase-1f at d=0.15 success,
+# they cost essentially nothing and give one-line per-epoch confirmation
+# that nothing is NaN at any point during training).
+assert "f\"         nan[obs_c=" in src, \
+    "per-epoch forward NaN one-liner missing — probes were stripped"
+assert "f\"         grad[c=" in src, \
+    "per-epoch grad/param one-liner missing — probes were stripped"
+assert "[prefill probe] buffer NaN anywhere:" in src, \
+    "post-prefill buffer-NaN probe missing — probes were stripped"
+assert "[epoch1 forensics]" in src, \
+    "epoch-1 time-series dump missing — probes were stripped"
+
+# Phase-1g α-cap. Job 1005888 (Phase-1f at d=0.15, 50 epochs) confirmed
+# that without the cap actor_loss diverges to ~−484K, with α_max=1.0 it
+# plateaus at −1.42. Phase-1e at d=0.05 ADDS a binding constraint term
+# (λ̃·Q_c/ν_c) on top of the same actor; running it without the α-cap
+# would re-introduce the divergence regardless of how λ̃ behaves. The
+# cap is non-negotiable for this run.
+assert "alpha_max: float = 1.0" in src, \
+    "Args.alpha_max field missing or default changed — α-cap not wired"
+assert "log_alpha_cap = jnp.log(jnp.maximum(args.alpha_max, 1e-12))" in src, \
+    "α-cap clip computation missing from sgd_step"
+assert "alpha_state = alpha_state.replace(params=clipped_log_alpha)" in src, \
+    "α-cap clip not applied to alpha_state — divergence will recur"
+assert "f\"         actor[α=" in src, \
+    "actor-component per-epoch one-liner missing"
+assert "α_clip={log_dict['alpha_clip_active']:.2f}" in src, \
+    "α_clip token missing from actor-component print line"
 
 # The broken Phase-1d claim must be gone
 assert "LayerNorm inside the encoders anchors" not in src, \
@@ -216,7 +261,7 @@ assert "LayerNorm inside the encoders anchors" not in src, \
 assert "-jnp.sqrt(_d2 + 1e-12)" not in src, \
     "old negative-L2 energy still present"
 
-print("Phase-1f static diff verified in train.py.")
+print("Phase-1e static diff (autograd-safe row-L2 + probes alive + α-cap) verified in train.py.")
 PYCHECK
 
 if [ $? -ne 0 ]; then
@@ -325,9 +370,14 @@ print(f"‖φ‖ (raw)  min/mean/max = {float(sa_raw_norms.min()):.4f} / "
 print(f"‖ψ‖ (raw)  min/mean/max = {float(g_raw_norms.min()):.4f} / "
       f"{float(g_raw_norms.mean()):.4f} / {float(g_raw_norms.max()):.4f}")
 
-# Apply the exact row-L2 normalization the loss functions use
-sa_hat = sa / (jnp.linalg.norm(sa, axis=-1, keepdims=True) + 1e-8)
-g_hat  = g  / (jnp.linalg.norm(g,  axis=-1, keepdims=True) + 1e-8)
+# Apply the EXACT autograd-safe row-L2 normalization train.py uses
+# (epsilon INSIDE sqrt, so the radicand is strictly positive and grad of
+# sqrt is finite even when sum(x²) underflows). Mirrors the form in
+# losses post-Phase-1f-fix; if you change one, change the other.
+sa_norm_safe = jnp.sqrt(jnp.sum(sa * sa, axis=-1, keepdims=True) + 1e-12)
+g_norm_safe  = jnp.sqrt(jnp.sum(g  * g,  axis=-1, keepdims=True) + 1e-12)
+sa_hat = sa / sa_norm_safe
+g_hat  = g  / g_norm_safe
 
 sa_norms = jnp.linalg.norm(sa_hat, axis=-1)
 g_norms  = jnp.linalg.norm(g_hat,  axis=-1)
