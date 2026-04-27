@@ -233,6 +233,16 @@ class TrajectoryUniformSamplingQueue():
             extras["d_wall"] = jnp.squeeze(transition.extras["d_wall"][:-1])
         if "hard_violation" in transition.extras:
             extras["hard_violation"] = jnp.squeeze(transition.extras["hard_violation"][:-1])
+        # Phase-1g velocity-quadratic diagnostics.  Same pass-through
+        # pattern as cost / d_wall / hard_violation: the collector populated
+        # these per-step scalars from the env's state.info, and we keep them
+        # in extras so cost_critic_loss_fn can read mean(v_xy_norm) and
+        # mean(vel_cost_mult) for logging.  Optional: if the env was
+        # constructed without these (older checkpoints), they won't appear.
+        if "v_xy_norm" in transition.extras:
+            extras["v_xy_norm"] = jnp.squeeze(transition.extras["v_xy_norm"][:-1])
+        if "vel_cost_mult" in transition.extras:
+            extras["vel_cost_mult"] = jnp.squeeze(transition.extras["vel_cost_mult"][:-1])
 
         return transition._replace(
             observation=jnp.squeeze(new_obs),

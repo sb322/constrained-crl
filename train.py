@@ -513,6 +513,12 @@ def main(args: Args):
             "cost":            jnp.zeros(()),
             "d_wall":          jnp.zeros(()),
             "hard_violation":  jnp.zeros(()),
+            # Phase-1g velocity-quadratic diagnostics — must be in the dummy
+            # so the buffer's pytree structure matches what collect_step /
+            # prefill_one actually insert. 0 is the correct placeholder
+            # (matches the "cost_type=quadratic" default's vel_cost_mult).
+            "v_xy_norm":       jnp.zeros(()),
+            "vel_cost_mult":   jnp.zeros(()),
         },
     )
 
@@ -846,6 +852,10 @@ def main(args: Args):
         cost           = transitions.extras["cost"]
         d_wall         = transitions.extras["d_wall"]
         hard_indicator = transitions.extras["hard_violation"]
+        # Phase-1g velocity-quadratic diagnostics. NOT used in the Bellman
+        # target — they are env-emitted side-channels, just for logging.
+        v_xy_norm      = transitions.extras["v_xy_norm"]
+        vel_cost_mult  = transitions.extras["vel_cost_mult"]
 
         # Next-state action from current policy (plain sample, no entropy)
         next_obs = jnp.concatenate([next_state, goal], axis=1)
@@ -882,6 +892,14 @@ def main(args: Args):
             "mean_d_wall":      jnp.mean(d_wall),
             "hard_violation_rate": jnp.mean(hard_indicator),
             "mean_qc":          jnp.mean(qc_online),
+            # Phase-1g velocity-quadratic diagnostics. mean_v_xy_norm tells
+            # us the typical torso speed in the maze plane; mean_vel_cost_mult
+            # tells us the typical velocity multiplier on the geometric cost
+            # shell (= 0 for non-velocity cost types). Together with
+            # mean_step_cost they let us decompose what the velocity-coupled
+            # cost is actually doing on the trained policy.
+            "mean_v_xy_norm":      jnp.mean(v_xy_norm),
+            "mean_vel_cost_mult":  jnp.mean(vel_cost_mult),
         }
 
     # ──────────────────────────────────────────────────────────
@@ -1084,7 +1102,8 @@ def main(args: Args):
             cc_loss = jnp.zeros(())
             cc_m = {k: jnp.zeros(()) for k in
                     ["cost_critic_loss", "mean_step_cost", "mean_d_wall",
-                     "hard_violation_rate", "mean_qc"]}
+                     "hard_violation_rate", "mean_qc",
+                     "mean_v_xy_norm", "mean_vel_cost_mult"]}
             j_c_hat_metric = jnp.zeros(())
             cc_grad_nan   = jnp.zeros(())
             cc_grad_norm  = jnp.zeros(())
@@ -1192,6 +1211,9 @@ def main(args: Args):
             "mean_d_wall":      cc_m["mean_d_wall"],
             "hard_violation_rate": cc_m["hard_violation_rate"],
             "mean_qc":          cc_m["mean_qc"],
+            # Phase-1g velocity-quadratic diagnostics
+            "mean_v_xy_norm":      cc_m["mean_v_xy_norm"],
+            "mean_vel_cost_mult":  cc_m["mean_vel_cost_mult"],
             "lambda_tilde":     lambda_tilde_new,
             "j_c_hat":          j_c_hat_metric,
             "mean_qc_pi":       mean_qc_pi,
@@ -1227,6 +1249,13 @@ def main(args: Args):
         _cost  = _prev_info["cost"]           if "cost"           in _prev_info else _zeros
         _dwall = _prev_info["d_wall"]         if "d_wall"         in _prev_info else _zeros
         _hviol = _prev_info["hard_violation"] if "hard_violation" in _prev_info else _zeros
+        # Phase-1g velocity-quadratic diagnostics. Same positional convention
+        # as `cost` / `d_wall` / `hard_violation` — read from _prev_info so
+        # the emitted scalar is paired with c(s_t). For non-velocity cost
+        # types the env still emits these as constants (v_xy_norm = ‖v_xy‖,
+        # vel_cost_mult = 0), so the schema is uniform.
+        _vnorm = _prev_info["v_xy_norm"]      if "v_xy_norm"      in _prev_info else _zeros
+        _vmult = _prev_info["vel_cost_mult"]  if "vel_cost_mult"  in _prev_info else _zeros
 
         next_env_state = env.step(env_state, action)
         _info = next_env_state.info
@@ -1259,6 +1288,10 @@ def main(args: Args):
                 "cost":            _cost,
                 "d_wall":          _dwall,
                 "hard_violation":  _hviol,
+                # Phase-1g velocity-quadratic diagnostics (env-level scalars,
+                # NOT used in the Bellman target — just for logging).
+                "v_xy_norm":       _vnorm,
+                "vel_cost_mult":   _vmult,
             },
         )
         return (next_env_state, actor_params, key), transition
@@ -1374,6 +1407,11 @@ def main(args: Args):
         _cost  = _info["cost"]           if "cost"           in _info else _zeros
         _dwall = _info["d_wall"]         if "d_wall"         in _info else _zeros
         _hviol = _info["hard_violation"] if "hard_violation" in _info else _zeros
+        # Phase-1g velocity-quadratic diagnostics — populate here too so the
+        # buffer's tree structure matches collect_step's. Velocity at prefill
+        # time comes from the random-action env step (post-step info).
+        _vnorm = _info["v_xy_norm"]      if "v_xy_norm"      in _info else _zeros
+        _vmult = _info["vel_cost_mult"]  if "vel_cost_mult"  in _info else _zeros
         t = Transition(
             observation=env_state.obs,
             action=action,
@@ -1389,6 +1427,8 @@ def main(args: Args):
                 "cost":            _cost,
                 "d_wall":          _dwall,
                 "hard_violation":  _hviol,
+                "v_xy_norm":       _vnorm,
+                "vel_cost_mult":   _vmult,
             },
         )
         t1 = jax.tree_util.tree_map(lambda x: x[None], t)  # add unroll dim=1
@@ -1628,6 +1668,14 @@ def main(args: Args):
                 "j_c_hat":              _j_c_hat,
                 # Constraint violation from critic-based estimator
                 "constraint_violation": max(0.0, _j_c_hat - args.cost_budget_d),
+                # Phase-1g velocity-quadratic diagnostics. mean_v_xy_norm
+                # is the typical torso speed; mean_vel_cost_mult is the
+                # velocity multiplier on the geometric cost shell (= 0
+                # for non-velocity cost types). Together they decompose
+                # the velocity-coupled cost into its motion and geometric
+                # components.
+                "mean_v_xy_norm":       float(jnp.mean(epoch_metrics["mean_v_xy_norm"])),
+                "mean_vel_cost_mult":   float(jnp.mean(epoch_metrics["mean_vel_cost_mult"])),
             })
 
         print(
@@ -1642,7 +1690,12 @@ def main(args: Args):
                 f"cost={log_dict['mean_step_cost']:.4f} "
                 f"λ̃={log_dict['lambda_tilde']:.4f} "
                 f"Ĵ_c={log_dict['j_c_hat']:.4f} "
-                f"Qc={log_dict['mean_qc']:.4f}"
+                f"Qc={log_dict['mean_qc']:.4f} "
+                # Phase-1g velocity-quadratic diagnostics. v_xy_norm tells
+                # us the typical torso speed; vel_mult is the velocity
+                # multiplier (= 0 for non-velocity cost types).
+                f"|v_xy|={log_dict['mean_v_xy_norm']:.3f} "
+                f"vel_mult={log_dict['mean_vel_cost_mult']:.3f}"
             )
         # Phase-1f NaN-forensics one-liner. Always printed so the probe values
         # appear next to c_loss/a_loss. Flags are 0/1 aggregated across the

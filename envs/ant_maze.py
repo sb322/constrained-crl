@@ -339,6 +339,17 @@ class AntMaze(PipelineEnv):
         #       the sigmoid produces a flat cost field over the corridor
         #       interior (σ(-33) ≈ 10⁻¹⁵ for d_wall=1.75, ε=0.1, τ=0.05),
         #       pinning λ̃ ≡ 0 and making safety vacuous.
+        #   - "velocity_quadratic": c_train = ‖v_xy‖² · (1 - d_wall/ε_train)²
+        #       on the same compact support. Couples cost with motion: cost
+        #       fires only when the ant is BOTH near a wall AND moving fast.
+        #       Reward (goal-reaching) pulls toward speed; cost pulls toward
+        #       slowing down whenever near walls. Reward and cost overlap in
+        #       state space, so the unconstrained reward-maximizer has
+        #       J_c > 0 and the CMDP can have a binding regime even with
+        #       moderate budgets. v_xy is the torso (x, y) velocity computed
+        #       in step() as (pos_t+1 − pos_t) / dt; at reset() the agent is
+        #       stationary so v_xy = 0 and cost = 0 (correct boundary).
+        #       Hard violation stays purely geometric: 1{d_wall < ε_hard}.
         #   - "sigmoid":    legacy c_train = σ((ε - d_wall)/τ).  Kept for
         #       ablation/back-compat; ignores cost_epsilon_hard.
         enable_cost: bool = True,
@@ -357,10 +368,10 @@ class AntMaze(PipelineEnv):
         # Safety-cost config (stored as plain Python attrs so JIT picks them up
         # as constants; wall_centers is a jax array bound at trace time).
         self._enable_cost = enable_cost
-        if cost_type not in ("quadratic", "sigmoid"):
+        if cost_type not in ("quadratic", "sigmoid", "velocity_quadratic"):
             raise ValueError(
                 f"Unknown cost_type '{cost_type}'. "
-                "Expected one of: 'quadratic', 'sigmoid'."
+                "Expected one of: 'quadratic', 'sigmoid', 'velocity_quadratic'."
             )
         self._cost_type = cost_type
         # For quadratic: cost_epsilon is the *shaping* bandwidth ε_train
@@ -434,8 +445,13 @@ class AntMaze(PipelineEnv):
 
         # Safety-cost scalars at initial state.  Even when enable_cost=False we
         # keep the keys in info so the collector pipeline has a uniform schema.
+        # At reset() the agent is stationary, so velocity_xy = 0 and the
+        # "velocity_quadratic" cost is automatically 0. v_xy_norm and
+        # vel_cost_mult are emitted for schema uniformity.
         agent_xy = pipeline_state.x.pos[0, :2]
-        cost0, d_wall0, hard0 = self._compute_safety_cost(agent_xy)
+        cost0, d_wall0, hard0, v_xy_norm0, vel_cost_mult0 = self._compute_safety_cost(
+            agent_xy
+        )
 
         reward, done, zero = jp.zeros(3)
         metrics = {
@@ -457,53 +473,98 @@ class AntMaze(PipelineEnv):
             "cost": cost0,
             "d_wall": d_wall0,
             "hard_violation": hard0,
+            # Phase-1g velocity-quadratic diagnostics.
+            "v_xy_norm": v_xy_norm0,
+            "vel_cost_mult": vel_cost_mult0,
         }
         info = {
             "seed": 0,
             "cost": cost0,
             "d_wall": d_wall0,
             "hard_violation": hard0,
+            "v_xy_norm": v_xy_norm0,
+            "vel_cost_mult": vel_cost_mult0,
         }
         state = State(pipeline_state, obs, reward, done, metrics)
         state.info.update(info)
         return state
 
-    def _compute_safety_cost(self, agent_xy: jax.Array) -> Tuple[jax.Array, jax.Array, jax.Array]:
-        """Compute (cost, d_wall, hard_violation) at a single agent (x, y).
+    def _compute_safety_cost(
+        self,
+        agent_xy: jax.Array,
+        velocity_xy: jax.Array = None,
+    ) -> Tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+        """Compute (cost, d_wall, hard_violation, v_xy_norm, vel_cost_mult) at
+        a single agent (x, y).
 
         Dispatches on self._cost_type:
-          - "quadratic":  cost = (1 - d_wall/ε_train)²  on d_wall ≤ ε_train,
-                          hard = 1{d_wall < ε_hard}   (separate threshold).
-          - "sigmoid"  :  cost = σ((ε - d_wall)/τ),    hard = 1{d_wall < ε}.
+          - "quadratic":           cost = (1 − d_wall/ε_train)²  on d_wall ≤ ε_train,
+                                   hard = 1{d_wall < ε_hard}   (separate threshold).
+          - "velocity_quadratic":  cost = ‖v_xy‖² · (1 − d_wall/ε_train)²  on the
+                                   same compact support. Couples cost with motion:
+                                   reward-maximizing trajectories that pass close
+                                   to walls now incur cost (because they're moving),
+                                   so J_c(π_unconstrained) > 0 and the CMDP can
+                                   have a binding regime. Hard violation is still
+                                   purely geometric — 1{d_wall < ε_hard} — so the
+                                   accounting threshold is decoupled from the
+                                   shaped training cost.
+          - "sigmoid"  :           cost = σ((ε − d_wall)/τ),    hard = 1{d_wall < ε}.
 
-        When self._enable_cost is False, returns zeros for cost and
-        hard_violation but still returns a correct d_wall (useful for
+        When self._enable_cost is False, returns zeros for cost and hard_violation
+        but still returns correct d_wall, v_xy_norm, and vel_cost_mult (useful for
         diagnostics even in the unconstrained baseline).
 
         Args:
-            agent_xy: shape [2] — ant torso (x, y) in maze frame.
+            agent_xy:    shape [2] — ant torso (x, y) in maze frame.
+            velocity_xy: shape [2] — ant torso (x, y) velocity. If None, treated
+                         as zeros (relevant only at reset(), where the ant is
+                         stationary and the velocity-coupled cost is 0 by
+                         construction; this matches the geometric "quadratic"
+                         path's behavior at reset).
 
         Returns:
             cost:           scalar training cost (disabled → 0).
             d_wall:         scalar, L2 distance from torso to nearest wall surface.
             hard_violation: scalar ∈ {0, 1} (disabled → 0).
+            v_xy_norm:      scalar, ‖v_xy‖₂ — diagnostic, tells us how fast the
+                            torso is moving in the maze plane.
+            vel_cost_mult:  scalar, ‖v_xy‖² — the velocity multiplier applied
+                            on top of the geometric quadratic shell. 0 for the
+                            "quadratic" / "sigmoid" cost types (so the
+                            diagnostic is uniform across cost types).
         """
-        if self._cost_type == "quadratic":
+        if velocity_xy is None:
+            velocity_xy = jp.zeros_like(agent_xy)
+        v_xy_sq   = jp.sum(velocity_xy * velocity_xy)
+        v_xy_norm = jp.sqrt(v_xy_sq + 1e-12)
+
+        if self._cost_type in ("quadratic", "velocity_quadratic"):
             cost, d_wall, hard = compact_quadratic_cost(
                 agent_xy, self._wall_centers, self._half_wall_size,
                 cost_epsilon_train=self._cost_epsilon,
                 cost_epsilon_hard=self._cost_epsilon_hard,
             )
+            if self._cost_type == "velocity_quadratic":
+                # Multiply the geometric quadratic shell by ‖v_xy‖² to couple
+                # cost with motion. Hard violation stays purely geometric — it
+                # is the accounting indicator, not the shaped training signal.
+                cost = v_xy_sq * cost
+                vel_cost_mult = v_xy_sq
+            else:
+                vel_cost_mult = jp.zeros_like(v_xy_sq)
         else:  # "sigmoid" — legacy path, kept for ablation
             cost, d_wall, hard = smooth_sigmoid_cost(
                 agent_xy, self._wall_centers, self._half_wall_size,
                 cost_epsilon=self._cost_epsilon,
                 cost_tau=self._cost_tau,
             )
+            vel_cost_mult = jp.zeros_like(v_xy_sq)
+
         if not self._enable_cost:
             cost = jp.zeros_like(cost)
             hard = jp.zeros_like(hard)
-        return cost, d_wall, hard
+        return cost, d_wall, hard, v_xy_norm, vel_cost_mult
 
     def step(self, state: State, action: jax.Array) -> State:
         """Run one timestep of the environment's dynamics."""
@@ -522,13 +583,23 @@ class AntMaze(PipelineEnv):
         # Rationale: exclude_current_positions_from_observation=True strips
         # (x, y) from obs, so obs[:, :2] is [z, quat_w] — wrong two dims.
         # This caused a flat cost signal (σ(2)=0.8806) across all v1/v2 runs.
-        agent_xy = pipeline_state.x.pos[0, :2]
-        cost, d_wall, hard_violation = self._compute_safety_cost(agent_xy)
-        info["cost"] = cost
-        info["d_wall"] = d_wall
-        info["hard_violation"] = hard_violation
-
+        #
+        # NOTE on ordering: velocity is computed BEFORE the safety cost so the
+        # "velocity_quadratic" cost type can read v_xy. For the "quadratic" /
+        # "sigmoid" paths the velocity is unused inside the cost dispatch but
+        # still surfaced via v_xy_norm / vel_cost_mult diagnostics.
         velocity = (pipeline_state.x.pos[0] - pipeline_state0.x.pos[0]) / self.dt
+
+        agent_xy    = pipeline_state.x.pos[0, :2]
+        velocity_xy = velocity[:2]
+        cost, d_wall, hard_violation, v_xy_norm, vel_cost_mult = (
+            self._compute_safety_cost(agent_xy, velocity_xy)
+        )
+        info["cost"]            = cost
+        info["d_wall"]          = d_wall
+        info["hard_violation"]  = hard_violation
+        info["v_xy_norm"]       = v_xy_norm
+        info["vel_cost_mult"]   = vel_cost_mult
 
         forward_reward = velocity[0]
 
@@ -572,6 +643,10 @@ class AntMaze(PipelineEnv):
             cost=cost,
             d_wall=d_wall,
             hard_violation=hard_violation,
+            # Phase-1g velocity-quadratic diagnostics (always populated for
+            # schema uniformity; vel_cost_mult is 0 for non-velocity cost types).
+            v_xy_norm=v_xy_norm,
+            vel_cost_mult=vel_cost_mult,
         )
         state.info.update(info)
         return state.replace(
